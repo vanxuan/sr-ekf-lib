@@ -14,6 +14,7 @@ export interface EkfConfig {
     position?: number
     velocity?: number
     heading?: number
+    sideslip?: number
     accelBias?: number
     gyroBias?: number
   }
@@ -21,6 +22,7 @@ export interface EkfConfig {
     position?: number
     velocity?: number
     heading?: number
+    sideslip?: number
     accelBias?: number
     gyroBias?: number
   }
@@ -70,8 +72,8 @@ export interface EkfDiagnostics {
 const DEFAULTS = {
   dt: 0.01,
   mode: 'auto' as Mode,
-  processNoise: { position: 1.0, velocity: 0.5, heading: 0.05, accelBias: 1e-4, gyroBias: 1e-5 },
-  walkingProcessNoise: { position: 2.0, velocity: 2.0, heading: 0.3, accelBias: 1e-3, gyroBias: 1e-4 },
+  processNoise: { position: 1.0, velocity: 0.5, heading: 0.05, sideslip: 0.1, accelBias: 1e-4, gyroBias: 1e-5 },
+  walkingProcessNoise: { position: 2.0, velocity: 2.0, heading: 0.3, sideslip: 0.3, accelBias: 1e-3, gyroBias: 1e-4 },
   measurementNoise: { position: 3.0, velocity: 0.5, heading: 0.1 },
   magneticDeclination: 0,
   initialCovariance: { position: 100, velocity: 10, heading: Math.PI * Math.PI, sideslip: 0.25, accelBias: 0.1, gyroBias: 0.01 },
@@ -676,7 +678,7 @@ export class SrEkf {
       this.tmpSqrtQ[I.Y][I.Y] = blend(pnDrive.position!, pnWalk.position!) * sqrtDt * speedScale;
       this.tmpSqrtQ[I.V][I.V] = blend(pnDrive.velocity!, pnWalk.velocity!) * sqrtDt * speedScale;
       this.tmpSqrtQ[I.PSI][I.PSI] = blend(pnDrive.heading!, pnWalk.heading!) * sqrtDt;
-      this.tmpSqrtQ[I.BETA][I.BETA] = blend(0.1, 0.3) * sqrtDt;
+      this.tmpSqrtQ[I.BETA][I.BETA] = blend(pnDrive.sideslip!, pnWalk.sideslip!) * sqrtDt;
       this.tmpSqrtQ[I.A_BIAS_X][I.A_BIAS_X] = blend(pnDrive.accelBias!, pnWalk.accelBias!) * sqrtDt;
       this.tmpSqrtQ[I.A_BIAS_Y][I.A_BIAS_Y] = blend(pnDrive.accelBias!, pnWalk.accelBias!) * sqrtDt;
       this.tmpSqrtQ[I.G_BIAS_Z][I.G_BIAS_Z] = blend(pnDrive.gyroBias!, pnWalk.gyroBias!) * sqrtDt;
@@ -685,7 +687,7 @@ export class SrEkf {
       this.tmpSqrtQ[I.Y][I.Y] = pn.position! * sqrtDt * speedScale;
       this.tmpSqrtQ[I.V][I.V] = pn.velocity! * sqrtDt * speedScale;
       this.tmpSqrtQ[I.PSI][I.PSI] = pn.heading! * sqrtDt;
-      this.tmpSqrtQ[I.BETA][I.BETA] = 0.1 * sqrtDt;
+      this.tmpSqrtQ[I.BETA][I.BETA] = pn.sideslip! * sqrtDt;
       this.tmpSqrtQ[I.A_BIAS_X][I.A_BIAS_X] = pn.accelBias! * sqrtDt;
       this.tmpSqrtQ[I.A_BIAS_Y][I.A_BIAS_Y] = pn.accelBias! * sqrtDt;
       this.tmpSqrtQ[I.G_BIAS_Z][I.G_BIAS_Z] = pn.gyroBias! * sqrtDt;

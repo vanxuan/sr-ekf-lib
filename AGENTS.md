@@ -134,16 +134,18 @@ interface EkfConfig {
   dt?: number                     // default prediction dt (s)
   mode?: 'walk' | 'drive' | 'auto'
   processNoise?: {
-    position?: number             // σ per √s for position (default 0.01)
+    position?: number             // σ per √s for position (default 1.0)
     velocity?: number             // σ per √s for velocity (default 0.5)
     heading?: number              // σ per √s for heading (default 0.05)
+    sideslip?: number             // σ per √s for sideslip (default 0.1)
     accelBias?: number            // σ per √s for accel bias walk (default 1e-4)
     gyroBias?: number             // σ per √s for gyro bias walk (default 1e-5)
   }
   walkingProcessNoise?: {         // same fields, higher defaults
-    position?: number             // (default 0.05)
+    position?: number             // (default 2.0)
     velocity?: number             // (default 2.0)
     heading?: number              // (default 0.3)
+    sideslip?: number             // (default 0.3)
     accelBias?: number            // (default 1e-3)
     gyroBias?: number             // (default 1e-4)
   }

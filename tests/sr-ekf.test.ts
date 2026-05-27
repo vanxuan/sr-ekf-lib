@@ -320,4 +320,24 @@ describe('SrEkf', () => {
     const ok = ekf.coast(50, 0)
     expect(ok).toBe(true)
   })
+
+  it('should respect sideslip process noise config', () => {
+    const ekf = new SrEkf({
+      mode: 'drive',
+      processNoise: { sideslip: 0 }
+    })
+    ekf.reset(0, 0, 10, 0)
+    for (let i = 0; i < 100; i++) {
+      ekf.predict(0, 0, 0.5, 0.01, i)
+    }
+    const s = ekf.getState()
+    const betaCov = s.p[4][4]
+    const ekfDefault = new SrEkf({ mode: 'drive' })
+    ekfDefault.reset(0, 0, 10, 0)
+    for (let i = 0; i < 100; i++) {
+      ekfDefault.predict(0, 0, 0.5, 0.01, i)
+    }
+    const sDefault = ekfDefault.getState()
+    expect(betaCov).toBeLessThan(sDefault.p[4][4])
+  })
 })
