@@ -1,0 +1,14 @@
+{
+  "name": "sr-ekf",
+  "version": "1.0.0",
+  "description": "Production-grade Square-Root Extended Kalman Filter for IMU+GPS fusion",
+  "main": "src/sr-ekf.ts",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "benchmark": "vitest run --config vitest.benchmark.ts"
+  },
+  "devDependencies": {
+    "vitest": "^3.1.3"
+  }
+}
