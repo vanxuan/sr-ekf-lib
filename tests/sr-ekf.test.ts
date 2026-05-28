@@ -36,12 +36,11 @@ describe('SrEkf', () => {
     expect(s.v).toBe(0)
     expect(s.psi).toBe(0)
     expect(s.aBiasX).toBe(0)
-    expect(s.aBiasY).toBe(0)
     expect(s.gBiasZ).toBe(0)
     expect(s.beta).toBe(0)
     const p = s.p
     expect(isSymmetric(p)).toBe(true)
-    for (let i = 0; i < 8; i++) expect(p[i][i]).toBeGreaterThan(0)
+    for (let i = 0; i < 7; i++) expect(p[i][i]).toBeGreaterThan(0)
   })
 
   it('should reset state correctly', () => {
@@ -55,7 +54,6 @@ describe('SrEkf', () => {
     expect(s.v).toBe(5)
     expect(s.psi).toBeCloseTo(0.5, 10)
     expect(s.aBiasX).toBe(0)
-    expect(s.aBiasY).toBe(0)
     expect(s.gBiasZ).toBe(0)
     const d2 = ekf.getDiagnostics()
     expect(d2.trace).toBeGreaterThan(0)
@@ -236,7 +234,7 @@ describe('SrEkf', () => {
     const s = ekf.getState()
     const P = s.p
     expect(isSymmetric(P)).toBe(true)
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 7; i++) {
       expect(P[i][i]).toBeGreaterThan(0)
     }
   })
@@ -334,7 +332,6 @@ describe('SrEkf', () => {
 
   it('should respect sideslip process noise config', () => {
     const ekf = new SrEkf({
-      mode: 'drive',
       processNoise: { sideslip: 0 }
     })
     ekf.reset(0, 0, 10, 0)
@@ -343,7 +340,7 @@ describe('SrEkf', () => {
     }
     const s = ekf.getState()
     const betaCov = s.p[4][4]
-    const ekfDefault = new SrEkf({ mode: 'drive' })
+    const ekfDefault = new SrEkf()
     ekfDefault.reset(0, 0, 10, 0)
     for (let i = 0; i < 100; i++) {
       ekfDefault.predict(0, 0, 0.5, 0.01, i)
@@ -397,36 +394,6 @@ describe('SrEkf', () => {
     ekf.updateMag(1.5, 0)
     const s = ekf.getState()
     expect(s.psi).toBeCloseTo(1.5, 5)
-  })
-
-  it('should detect walk mode from step frequency and speed', () => {
-    const ekf = new SrEkf({ mode: 'auto' })
-    ekf.reset(0, 0, 0, 0)
-    const dt = 0.01
-    for (let i = 0; i < 500; i++) {
-      const ax = Math.sin(2 * Math.PI * 2 * i * dt)
-      ekf.predict(ax, 0, 0, dt, i)
-      if (i % 100 === 0) {
-        ekf.updateGps(0, 0, 1.2, 0, i)
-      }
-    }
-    const d = ekf.getDiagnostics()
-    expect(d.walkLikelihood).toBeGreaterThan(0.5)
-  })
-
-  it('should stay in drive mode at high speed', () => {
-    const ekf = new SrEkf({ mode: 'auto' })
-    ekf.reset(0, 0, 10, 0)
-    const dt = 0.01
-    for (let i = 0; i < 300; i++) {
-      const ax = Math.sin(2 * Math.PI * 2 * i * dt)
-      ekf.predict(ax, 0, 0, dt, i)
-      if (i % 50 === 0) {
-        ekf.updateGps(10 * i * dt, 0, 10, 0, i)
-      }
-    }
-    const d = ekf.getDiagnostics()
-    expect(d.mode).toBe('drive')
   })
 
   it('should rotate IMU readings with non-identity orientation', () => {
@@ -580,12 +547,10 @@ describe('SrEkf', () => {
     expect(s).toHaveProperty('psi')
     expect(s).toHaveProperty('beta')
     expect(s).toHaveProperty('aBiasX')
-    expect(s).toHaveProperty('aBiasY')
     expect(s).toHaveProperty('gBiasZ')
     expect(s).toHaveProperty('p')
-    expect(s).toHaveProperty('mode')
-    expect(s.p.length).toBe(8)
-    expect(s.p[0].length).toBe(8)
+    expect(s.p.length).toBe(7)
+    expect(s.p[0].length).toBe(7)
     expect(isSymmetric(s.p)).toBe(true)
   })
 
@@ -603,8 +568,6 @@ describe('SrEkf', () => {
     expect(d).toHaveProperty('coasting')
     expect(d).toHaveProperty('lastGpsTimeMs')
     expect(d).toHaveProperty('lastImuTimeMs')
-    expect(d).toHaveProperty('mode')
-    expect(d).toHaveProperty('walkLikelihood')
     expect(d).toHaveProperty('stationary')
     expect(d).toHaveProperty('magDeclination')
     expect(d).toHaveProperty('robustWeight')
@@ -677,45 +640,8 @@ describe('SrEkf', () => {
     expect(ekf.getDiagnostics().adaNoiseScale).toBeGreaterThan(1.5)
   })
 
-  it('should keep IMM mode probabilities at prior with zero-information input', () => {
+  it('should track IMU-only stationary correctly', () => {
     const ekf = new SrEkf({
-      imm: { enabled: true },
-      measurementNoise: { position: 1.0, velocity: 0.3 },
-    })
-    ekf.reset(0, 0, 0, 0)
-    for (let i = 0; i < 100; i++) {
-      ekf.predict(0, 0, 0, 0.01, i)
-    }
-    const d = ekf.getDiagnostics()
-    expect(d.walkLikelihood).toBeCloseTo(0.5, 2)
-  })
-
-  it('should converge heading with IMM enabled', () => {
-    const ekf = new SrEkf({
-      imm: { enabled: true },
-      measurementNoise: { position: 0.5, velocity: 0.1, heading: 0.1 },
-      processNoise: { position: 0.001, velocity: 0.01, heading: 0.001, accelBias: 0, gyroBias: 0 }
-    })
-    ekf.reset(0, 0, 0, 0)
-    const trueV = 10
-    const truePsi = 0.3
-    const trueVx = trueV * Math.cos(truePsi)
-    const trueVy = trueV * Math.sin(truePsi)
-    for (let i = 0; i < 50; i++) {
-      const t = i * 0.1
-      ekf.predict(0, 0, 0, 0.1, i)
-      ekf.updateGps(trueVx * t, trueVy * t, trueVx, trueVy, i)
-    }
-    const s = ekf.getState()
-    expect(s.x).toBeGreaterThan(40)
-    expect(s.y).toBeGreaterThan(10)
-    expect(Math.abs(s.psi - truePsi)).toBeLessThan(0.15)
-    expect(Math.abs(s.v - trueV)).toBeLessThan(0.8)
-  })
-
-  it('should track IMU-only stationary correctly with IMM enabled', () => {
-    const ekf = new SrEkf({
-      imm: { enabled: true },
       processNoise: { position: 0, velocity: 0, heading: 0, accelBias: 0, gyroBias: 0 }
     })
     ekf.reset(100, 200, 0, 0)
