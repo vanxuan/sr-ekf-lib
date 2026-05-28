@@ -311,14 +311,13 @@ export class SrEkf {
   private tmpFS: Float64Array[];
   private tmpSqrtQ: Float64Array[];
   private tmpH: Float64Array[];
-  private tmpP: Float64Array[];
+  private tmpA: Float64Array[];
   private tmpInnov: Float64Array;
   private tmpWork4x4: Float64Array[];
   private tmpSinv: Float64Array[];
   private tmpQR: Float64Array[];
   private tmpHouseV: Float64Array;
   private tmpZ: Float64Array;
-  private tmpK: Float64Array[];
   private tmpPreA: Float64Array[];
   private tmpPreAT: Float64Array[];
   private tmpMagHS: Float64Array;
@@ -365,14 +364,13 @@ export class SrEkf {
     this.tmpFS = matCreate(N, N);
     this.tmpSqrtQ = matCreate(N, N);
     this.tmpH = matCreate(M, N);
-    this.tmpP = matCreate(N, N);
+    this.tmpA = matCreate(M, N);
     this.tmpInnov = new Float64Array(M);
     this.tmpWork4x4 = matCreate(M, M);
     this.tmpSinv = matCreate(M, M);
     this.tmpQR = matCreate(2 * N, N);
     this.tmpHouseV = new Float64Array(2 * N);
     this.tmpZ = new Float64Array(M);
-    this.tmpK = matCreate(N, M);
     this.tmpPreA = matCreate(PRE, PRE);
     this.tmpPreAT = matCreate(PRE, PRE);
     this.tmpMagHS = new Float64Array(N);
@@ -886,18 +884,28 @@ export class SrEkf {
     this.tmpInnov[2] = z[2] - v * Math.cos(psiBeta);
     this.tmpInnov[3] = z[3] - v * Math.sin(psiBeta);
 
-    const P = matLowerToFull(this.S);
-    this.tmpP = P;
     const H = this.tmpH;
+    const S = this.S;
+    const A = this.tmpA;
 
-    for (let i = 0; i < M; i++)
-      for (let j = 0; j < M; j++) {
+    for (let i = 0; i < M; i++) {
+      const Ai = A[i];
+      for (let j = 0; j < N; j++) {
         let s = 0;
-        for (let k = 0; k < N; k++)
-          for (let l = 0; l < N; l++)
-            s += H[i][k] * P[k][l] * H[j][l];
-        this.tmpWork4x4[i][j] = s;
+        for (let k = j; k < N; k++) s += H[i][k] * S[k][j];
+        Ai[j] = s;
       }
+    }
+
+    for (let i = 0; i < M; i++) {
+      const Ai = A[i];
+      for (let j = 0; j <= i; j++) {
+        let s = 0;
+        for (let k = 0; k < N; k++) s += Ai[k] * A[j][k];
+        this.tmpWork4x4[i][j] = s;
+        this.tmpWork4x4[j][i] = s;
+      }
+    }
   }
 
   private computeGpsPostFit(posR: number, velR: number): number {
@@ -985,24 +993,26 @@ export class SrEkf {
       return false;
     }
 
-    const P = this.tmpP;
+    const A = this.tmpA;
     const H = this.tmpH;
-    const K = this.tmpK;
     const L = this.tmpSinv;
-    const b = new Float64Array(M);
-    for (let i = 0; i < N; i++) {
-      for (let l = 0; l < M; l++) {
-        let s = 0;
-        for (let k = 0; k < N; k++) s += H[l][k] * P[k][i];
-        b[l] = s;
-      }
-      cholSolve4(L, b);
-      for (let l = 0; l < M; l++) K[i][l] = b[l];
+    const w = new Float64Array(M);
+
+    for (let i = 0; i < M; i++) w[i] = this.tmpInnov[i];
+    cholSolve4(L, w);
+
+    const z = new Float64Array(N);
+    for (let j = 0; j < N; j++) {
+      let s = 0;
+      for (let i = 0; i < M; i++) s += A[i][j] * w[i];
+      z[j] = s;
     }
 
-    for (let i = 0; i < N; i++)
-      for (let j = 0; j < M; j++)
-        this.x[i] += K[i][j] * this.tmpInnov[j];
+    for (let i = 0; i < N; i++) {
+      let s = 0;
+      for (let j = 0; j <= i; j++) s += this.S[i][j] * z[j];
+      this.x[i] += s;
+    }
     this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
     this.x[I.V] = Math.max(0, this.x[I.V]);
 
