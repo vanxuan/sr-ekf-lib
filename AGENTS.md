@@ -117,15 +117,41 @@ Jacobian H (4×8):
 ### Stop-and-Go Position Hold
 - When ZUPT triggers, a 3-measurement QR update pins v=0 AND (x,y) at current estimate:
   - v: R=0.01 m/s (existing velocity ZUPT)
-  - x: R=0.01 m (new — position hold)
-  - y: R=0.01 m (new — position hold)
+  - x: R=1.0 m (position hold — moderate, prevents GPS drift without over-constraining)
+  - y: R=1.0 m (position hold)
 - Prevents GPS position drift from pulling the filter during stops (e.g., at traffic lights)
 - Single fused QR decomposition avoids redundant Householder reflections
+- On stationary→moving transition, X/Y/V/PSI Cholesky rows inflated 5× to restore reasonable uncertainty (σ ≈ 5 m for position after a stop)
 
 ### Frame Alignment
 - `setOrientation(azimuth, pitch, roll)` sets device-to-ENU rotation matrix
 - When orientation is set and 6-axis IMU provided, readings rotate before bias compensation
 - Call from `RotationVector` or `getRotationMatrix()` sensor each frame
+
+### Robust M-Estimation (Cauchy/Huber)
+- Replaces binary Mahalanobis gate with a smooth weight function when enabled
+- **Cauchy**: `w = 1 / (1 + (χ²/threshold)²)` — heavy-tailed, continues downweighting without hard cutoff
+- **Huber**: `w = threshold / max(χ², threshold)` — linear penalty beyond threshold, zero weight at infinity
+- When enabled, the binary gate (`gateThreshold`) is bypassed; the weight handles downweighting
+- Config: `robustWeight.enabled`, `.type` ('cauchy'|'huber'), `.threshold` (default 9.488)
+- Diagnostics exposed as `robustWeight` (0–1) in `EkfDiagnostics`
+
+### Adaptive Noise Scaling
+- EMA tracks `innov² / S_innov` ratio across GPS updates to detect when the filter is overconfident
+- When the ratio consistently exceeds 1, inflates R by an adaptive scale factor
+- Scale factor: `adaScale = 1 + clamp(adaScale₋₁ × smoothing + ratio × (1−smoothing) − 1, 0, maxScale)`
+- Config: `adaptiveNoise.enabled`, `.smoothing` (0–1, default 0.3), `.maxScale` (default 10)
+- Diagnostics exposed as `adaNoiseScale` in `EkfDiagnostics`
+
+### Interacting Multiple Model (IMM)
+- Two parallel SR-EKFs (walk + drive) with independent state vectors and Cholesky factors
+- **Mixing** (`immMix`): mode-conditioned re-initialization via Cholesky-decomposed mixed covariances before predict
+- **Mode probability propagation** via fixed transition matrix (`p_ii = 0.9`, `p_ij = 0.1`)
+- **Mode probability update** from measurement likelihood ratio after each GPS/mag update
+- **Output combination** (`immRecombine`): weighted average of mode-specific states; covariance via Cholesky of the combined mixture
+- Zero process-noise Q-blending under IMM (each mode uses its own pure process noise)
+- Config: `imm.enabled`, `.transitionMatrix` (default `[[0.9, 0.1], [0.1, 0.9]]`)
+- `EkfDiagnostics.walkLikelihood` reflects the walk-mode probability from IMM when enabled
 
 ## Configuration
 
@@ -166,6 +192,20 @@ interface EkfConfig {
   gateThreshold?: number          // Mahalanobis chi-square threshold (default 9.488)
   coastTimeoutMs?: number         // max IMU-only time before flagging divergence (default 5000)
   gpsTimeOffsetMs?: number        // GNSS→local clock offset (default 0)
+  robustWeight?: {
+    enabled?: boolean             // enable robust M-estimation (default false)
+    type?: 'cauchy' | 'huber'    // weight function (default 'cauchy')
+    threshold?: number            // chi-square scaling threshold (default 9.488)
+  }
+  adaptiveNoise?: {
+    enabled?: boolean             // enable adaptive noise scaling (default false)
+    smoothing?: number            // EMA smoothing factor 0–1 (default 0.3)
+    maxScale?: number             // maximum R inflation factor (default 10)
+  }
+  imm?: {
+    enabled?: boolean             // enable Interacting Multiple Model (default false)
+    transitionMatrix?: number[][] // mode transition matrix 2×2 (default [[0.9,0.1],[0.1,0.9]])
+  }
 }
 ```
 
@@ -189,7 +229,7 @@ class SrEkf {
   // Set device orientation for IMU frame alignment
   setOrientation(azimuth: number, pitch: number, roll: number): void
 
-  // Coast detection (returns false if covariance has diverged)
+  // Coast detection (sets coasting flag based on GPS timeout)
   coast(timeoutMs: number, currentTimeMs: number): boolean
 
   // Retrieve current navigation solution
@@ -218,13 +258,16 @@ interface EkfDiagnostics {
   gpsInnovation: number[];       // 4-element innovation vector (last GPS update)
   gpsChiSq: number;              // chi-square statistic (last GPS update)
   gatePassed: boolean;           // last GPS update passed gating
-  coasting: boolean;             // currently in coast mode
-  lastGpsTimeMs: number;         // timestamp of last successful GPS update
-  lastImuTimeMs: number;         // timestamp of last IMU prediction
-  mode: 'walk' | 'drive';       // actual active mode
-  walkLikelihood: number;        // 0–1 likelihood of walking
-  stationary: boolean;           // ZUPT stationary detection flag
-  magDeclination: number;        // current magnetic declination estimate
+  coasting: boolean;               // timestamps indicate GPS timeout exceeded
+
+  lastGpsTimeMs: number;           // timestamp of last successful GPS update
+  lastImuTimeMs: number;           // timestamp of last IMU prediction
+  mode: 'walk' | 'drive';         // actual active mode
+  walkLikelihood: number;          // 0–1 likelihood of walking (IMM mode prob when enabled)
+  stationary: boolean;             // ZUPT stationary detection flag
+  magDeclination: number;          // current magnetic declination estimate
+  robustWeight: number;            // 0–1 weight from robust M-estimation (last update)
+  adaNoiseScale: number;           // current adaptive noise scaling factor
 }
 ```
 
@@ -240,6 +283,6 @@ For log replay: pass the same timestamps in sequence and get identical outputs.
 ## Validation
 
 ```bash
-npm test                 # 17 unit tests
+npm test                 # 39 unit tests
 npm run test:watch       # watch mode
 ```

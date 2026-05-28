@@ -290,6 +290,17 @@ describe('SrEkf', () => {
     expect(Math.abs(s.psi - truePsi)).toBeLessThan(0.1)
   })
 
+  it('should recover heading from 180° error using GPS velocity', () => {
+    const ekf = new SrEkf({
+      measurementNoise: { position: 3.0, velocity: 0.5 }
+    })
+    ekf.reset(0, 0, 5, Math.PI)
+    ekf.updateGps(0, 0, -5, 0, 0)
+    ekf.updateGps(10, 0, 5, 0, 1)
+    const s = ekf.getState()
+    expect(Math.abs(s.psi)).toBeLessThan(0.1)
+  })
+
   it('should handle accelerating motion', () => {
     const ekf = new SrEkf({
       measurementNoise: { position: 2.0, velocity: 0.5 },
@@ -339,5 +350,381 @@ describe('SrEkf', () => {
     }
     const sDefault = ekfDefault.getState()
     expect(betaCov).toBeLessThan(sDefault.p[4][4])
+  })
+
+  it('should detect stationary via IMU variance and trigger ZUPT', () => {
+    const ekf = new SrEkf()
+    ekf.reset(100, 200, 0, 0)
+    for (let i = 0; i < 50; i++) {
+      ekf.predict(0, 0, 0, 0.01, i)
+    }
+    const d = ekf.getDiagnostics()
+    expect(d.stationary).toBe(true)
+    const s = ekf.getState()
+    expect(s.v).toBeCloseTo(0, 6)
+    const posCov = s.p[0][0]
+    expect(posCov).toBeLessThan(2)
+  })
+
+  it('should restore motion after stationary ends', () => {
+    const ekf = new SrEkf()
+    ekf.reset(100, 200, 0, 0)
+    for (let i = 0; i < 50; i++) {
+      ekf.predict(0, 0, 0, 0.01, i)
+    }
+    expect(ekf.getDiagnostics().stationary).toBe(true)
+    for (let i = 0; i < 30; i++) {
+      ekf.predict(1, 0, 0, 0.01, i + 50)
+    }
+    const d = ekf.getDiagnostics()
+    expect(d.stationary).toBe(false)
+  })
+
+  it('should converge heading from magnetometer updates', () => {
+    const ekf = new SrEkf({ measurementNoise: { heading: 0.1 } })
+    ekf.reset(0, 0, 5, Math.PI)
+    for (let i = 0; i < 50; i++) {
+      ekf.updateMag(0, i)
+    }
+    const s = ekf.getState()
+    expect(Math.abs(s.psi)).toBeLessThan(0.5)
+  })
+
+  it('should auto-initialize heading from first mag update (no GPS)', () => {
+    const ekf = new SrEkf()
+    ekf.reset(0, 0, 0, 0)
+    expect(ekf.getState().psi).toBe(0)
+    ekf.updateMag(1.5, 0)
+    const s = ekf.getState()
+    expect(s.psi).toBeCloseTo(1.5, 5)
+  })
+
+  it('should detect walk mode from step frequency and speed', () => {
+    const ekf = new SrEkf({ mode: 'auto' })
+    ekf.reset(0, 0, 0, 0)
+    const dt = 0.01
+    for (let i = 0; i < 500; i++) {
+      const ax = Math.sin(2 * Math.PI * 2 * i * dt)
+      ekf.predict(ax, 0, 0, dt, i)
+      if (i % 100 === 0) {
+        ekf.updateGps(0, 0, 1.2, 0, i)
+      }
+    }
+    const d = ekf.getDiagnostics()
+    expect(d.walkLikelihood).toBeGreaterThan(0.5)
+  })
+
+  it('should stay in drive mode at high speed', () => {
+    const ekf = new SrEkf({ mode: 'auto' })
+    ekf.reset(0, 0, 10, 0)
+    const dt = 0.01
+    for (let i = 0; i < 300; i++) {
+      const ax = Math.sin(2 * Math.PI * 2 * i * dt)
+      ekf.predict(ax, 0, 0, dt, i)
+      if (i % 50 === 0) {
+        ekf.updateGps(10 * i * dt, 0, 10, 0, i)
+      }
+    }
+    const d = ekf.getDiagnostics()
+    expect(d.mode).toBe('drive')
+  })
+
+  it('should rotate IMU readings with non-identity orientation', () => {
+    const ekf = new SrEkf({
+      processNoise: { position: 0, velocity: 0, heading: 0, accelBias: 0, gyroBias: 0 }
+    })
+    ekf.reset(0, 0, 0, 0)
+    ekf.setOrientation(Math.PI / 2, 0, 0)
+    ekf.predict(1, 0, 0, 0.1, 0, 0, 0, 0)
+    const s = ekf.getState()
+    expect(s.v).toBeCloseTo(0, 4)
+  })
+
+  it('should rotate device-y acceleration to east with azimuth=π/2', () => {
+    const ekf = new SrEkf({
+      processNoise: { position: 0, velocity: 0, heading: 0, accelBias: 0, gyroBias: 0 }
+    })
+    ekf.reset(0, 0, 0, 0)
+    ekf.setOrientation(Math.PI / 2, 0, 0)
+    ekf.predict(0, 1, 0, 0.1, 0)
+    ekf.predict(0, 1, 0, 0.1, 1)
+    const s = ekf.getState()
+    expect(s.x).toBeGreaterThan(0.005)
+  })
+
+  it('should preserve behavior with identity orientation', () => {
+    const ekf = new SrEkf({
+      processNoise: { position: 0, velocity: 0, heading: 0, accelBias: 0, gyroBias: 0 }
+    })
+    ekf.reset(0, 0, 0, 0)
+
+    const ekfRef = new SrEkf({
+      processNoise: { position: 0, velocity: 0, heading: 0, accelBias: 0, gyroBias: 0 }
+    })
+    ekfRef.reset(0, 0, 0, 0)
+
+    ekf.setOrientation(0, 0, 0)
+    ekf.predict(2, 0, 0.5, 0.1, 0, 0, 0, 0)
+    ekfRef.predict(2, 0, 0.5, 0.1, 0)
+
+    const s1 = ekf.getState()
+    const s2 = ekfRef.getState()
+    expect(s1.x).toBeCloseTo(s2.x, 10)
+    expect(s1.y).toBeCloseTo(s2.y, 10)
+    expect(s1.v).toBeCloseTo(s2.v, 10)
+    expect(s1.psi).toBeCloseTo(s2.psi, 10)
+  })
+
+  it('should separate sideslip from heading using mag + GPS', () => {
+    const ekf = new SrEkf({
+      measurementNoise: { position: 10.0, velocity: 0.3, heading: 0.05 },
+      processNoise: { position: 0.1, velocity: 0.1, heading: 0.001, sideslip: 0.2, accelBias: 0, gyroBias: 0 }
+    })
+    ekf.reset(0, 0, 10, 0)
+    const omega = 0.3
+    const trueBeta = 0.08
+    for (let i = 0; i < 200; i++) {
+      const t = i * 0.1
+      ekf.predict(0, 0, omega, 0.1, i)
+      const psi_t = omega * t
+      const alpha = psi_t + trueBeta
+      const x = (10 / omega) * (Math.sin(omega * t + trueBeta) - Math.sin(trueBeta))
+      const y = (10 / omega) * (-Math.cos(omega * t + trueBeta) + Math.cos(trueBeta))
+      ekf.updateMag(psi_t, i)
+      ekf.updateGps(x, y, 10 * Math.cos(alpha), 10 * Math.sin(alpha), i, 15)
+    }
+    const s = ekf.getState()
+    expect(s.beta).toBeGreaterThan(0.03)
+  })
+
+  it('should report coasting when timeout exceeded', () => {
+    const ekf = new SrEkf({
+      processNoise: { position: 10, velocity: 10, heading: 1, accelBias: 0.1, gyroBias: 0.01 }
+    })
+    ekf.reset(0, 0, 100, 0)
+    ekf.updateGps(0, 0, 100, 0, 0)
+    for (let i = 1; i < 5000; i++) {
+      ekf.predict(0, 0, 0, 0.01, i)
+    }
+    const ok = ekf.coast(100, 5000)
+    expect(ok).toBe(true)
+    const d = ekf.getDiagnostics()
+    expect(d.coasting).toBe(true)
+  })
+
+  it('should accept larger innovations with high accuracyMeters', () => {
+    const ekf = new SrEkf({
+      measurementNoise: { position: 3.0, velocity: 0.5 },
+      gateThreshold: 9.488
+    })
+    ekf.reset(0, 0, 5, 0)
+    ekf.updateGps(0, 0, 5, 0, 0, 3)
+    const result = ekf.updateGps(1000, 1000, 5, 0, 1, 500)
+    expect(result).toBe(true)
+    expect(ekf.getDiagnostics().gatePassed).toBe(true)
+
+    const ekf2 = new SrEkf({
+      measurementNoise: { position: 3.0, velocity: 0.5 },
+      gateThreshold: 9.488
+    })
+    ekf2.reset(0, 0, 5, 0)
+    ekf2.updateGps(0, 0, 5, 0, 0)
+    const result2 = ekf2.updateGps(1000, 1000, 5, 0, 1)
+    expect(result2).toBe(false)
+  })
+
+  it('should calibrate magnetic declination from GPS heading', () => {
+    const ekf = new SrEkf({
+      measurementNoise: { position: 2.0, velocity: 0.3 }
+    })
+    ekf.reset(0, 0, 10, 0)
+    const trueHdg = 0.5
+    const magDeclination = 0.2
+    for (let i = 0; i < 10; i++) {
+      const t = i * 0.1
+      ekf.predict(0, 0, 0, 0.1, i)
+      ekf.updateGps(
+        10 * Math.cos(trueHdg) * t,
+        10 * Math.sin(trueHdg) * t,
+        10 * Math.cos(trueHdg),
+        10 * Math.sin(trueHdg),
+        i
+      )
+    }
+    ekf.updateMag(trueHdg - magDeclination, 100)
+    expect(ekf.getDiagnostics().magDeclination).toBeCloseTo(0, 2)
+    for (let i = 0; i < 40; i++) {
+      const t = i * 0.1 + 1.0
+      ekf.predict(0, 0, 0, 0.1, i + 100)
+      ekf.updateGps(
+        10 * Math.cos(trueHdg) * t,
+        10 * Math.sin(trueHdg) * t,
+        10 * Math.cos(trueHdg),
+        10 * Math.sin(trueHdg),
+        i + 100,
+        5
+      )
+      ekf.updateMag(trueHdg - magDeclination, i + 100)
+    }
+    const d = ekf.getDiagnostics()
+    expect(d.magDeclination).toBeGreaterThan(0.05)
+  })
+
+  it('should return NavigationSolution with correct shape', () => {
+    const ekf = new SrEkf()
+    ekf.reset(10, 20, 5, 0.5)
+    const s = ekf.getState()
+    expect(s).toHaveProperty('x')
+    expect(s).toHaveProperty('y')
+    expect(s).toHaveProperty('v')
+    expect(s).toHaveProperty('psi')
+    expect(s).toHaveProperty('beta')
+    expect(s).toHaveProperty('aBiasX')
+    expect(s).toHaveProperty('aBiasY')
+    expect(s).toHaveProperty('gBiasZ')
+    expect(s).toHaveProperty('p')
+    expect(s).toHaveProperty('mode')
+    expect(s.p.length).toBe(8)
+    expect(s.p[0].length).toBe(8)
+    expect(isSymmetric(s.p)).toBe(true)
+  })
+
+  it('should return EkfDiagnostics with correct shape', () => {
+    const ekf = new SrEkf()
+    ekf.reset(0, 0, 5, 0)
+    ekf.predict(0, 0, 0, 0.01, 0)
+    ekf.updateGps(0, 0, 5, 0, 1)
+    const d = ekf.getDiagnostics()
+    expect(d).toHaveProperty('trace')
+    expect(d).toHaveProperty('gpsInnovation')
+    expect(d.gpsInnovation).toHaveLength(4)
+    expect(d).toHaveProperty('gpsChiSq')
+    expect(d).toHaveProperty('gatePassed')
+    expect(d).toHaveProperty('coasting')
+    expect(d).toHaveProperty('lastGpsTimeMs')
+    expect(d).toHaveProperty('lastImuTimeMs')
+    expect(d).toHaveProperty('mode')
+    expect(d).toHaveProperty('walkLikelihood')
+    expect(d).toHaveProperty('stationary')
+    expect(d).toHaveProperty('magDeclination')
+    expect(d).toHaveProperty('robustWeight')
+    expect(d).toHaveProperty('adaNoiseScale')
+  })
+
+  it('should downweight large innovations with robust M-estimation (Cauchy)', () => {
+    const ekf = new SrEkf({
+      measurementNoise: { position: 1.0, velocity: 0.5 },
+      gateThreshold: 9.488,
+      robustWeight: { enabled: true, type: 'cauchy', threshold: 9.488 }
+    })
+    ekf.reset(0, 0, 5, 0)
+    ekf.updateGps(0, 0, 5, 0, 0)
+    const w1 = ekf.getDiagnostics().robustWeight
+    expect(w1).toBeCloseTo(1, 2)
+
+    ekf.updateGps(1000, 1000, 5, 0, 1)
+    const w2 = ekf.getDiagnostics().robustWeight
+    expect(w2).toBeLessThan(0.5)
+    expect(w2).toBeGreaterThan(0)
+    const d = ekf.getDiagnostics()
+    expect(d.gatePassed).toBe(true)
+  })
+
+  it('should downweight with Huber robust M-estimation', () => {
+    const ekf = new SrEkf({
+      measurementNoise: { position: 1.0, velocity: 0.5 },
+      gateThreshold: 9.488,
+      robustWeight: { enabled: true, type: 'huber', threshold: 9.488 }
+    })
+    ekf.reset(0, 0, 5, 0)
+    for (let i = 0; i < 10; i++) {
+      ekf.predict(0, 0, 0, 0.1, i + 1)
+      ekf.updateGps(0.5 * (i + 1), 0, 5, 0, i + 1)
+    }
+    ekf.updateGps(1000, 1000, 5, 0, 100)
+    const w = ekf.getDiagnostics().robustWeight
+    expect(w).toBeLessThan(0.5)
+    expect(w).toBeGreaterThan(0)
+    const s = ekf.getState()
+    expect(Math.abs(s.x - 5)).toBeLessThan(20)
+    expect(ekf.getDiagnostics().gatePassed).toBe(true)
+  })
+
+  it('should reject extreme outliers via binary gate when robust M is disabled', () => {
+    const ekf = new SrEkf({
+      measurementNoise: { position: 1.0, velocity: 0.5 },
+      gateThreshold: 9.488,
+      robustWeight: { enabled: false }
+    })
+    ekf.reset(0, 0, 5, 0)
+    ekf.updateGps(0, 0, 5, 0, 0)
+    const result = ekf.updateGps(1e6, 1e6, 5, 0, 1)
+    expect(result).toBe(false)
+  })
+
+  it('should inflate R via adaptive noise when innovations are large', () => {
+    const ekf = new SrEkf({
+      measurementNoise: { position: 1.0, velocity: 0.5 },
+      adaptiveNoise: { enabled: true, smoothing: 0.3, maxScale: 20 }
+    })
+    ekf.reset(0, 0, 5, 0)
+    ekf.updateGps(0, 0, 5, 0, 0)
+    expect(ekf.getDiagnostics().adaNoiseScale).toBe(1)
+    for (let i = 0; i < 20; i++) {
+      ekf.predict(0, 0, 0, 0.1, i + 1)
+      ekf.updateGps(100, 100, 5, 0, i + 1)
+    }
+    expect(ekf.getDiagnostics().adaNoiseScale).toBeGreaterThan(1.5)
+  })
+
+  it('should keep IMM mode probabilities at prior with zero-information input', () => {
+    const ekf = new SrEkf({
+      imm: { enabled: true },
+      measurementNoise: { position: 1.0, velocity: 0.3 },
+    })
+    ekf.reset(0, 0, 0, 0)
+    for (let i = 0; i < 100; i++) {
+      ekf.predict(0, 0, 0, 0.01, i)
+    }
+    const d = ekf.getDiagnostics()
+    expect(d.walkLikelihood).toBeCloseTo(0.5, 2)
+  })
+
+  it('should converge heading with IMM enabled', () => {
+    const ekf = new SrEkf({
+      imm: { enabled: true },
+      measurementNoise: { position: 0.5, velocity: 0.1, heading: 0.1 },
+      processNoise: { position: 0.001, velocity: 0.01, heading: 0.001, accelBias: 0, gyroBias: 0 }
+    })
+    ekf.reset(0, 0, 0, 0)
+    const trueV = 10
+    const truePsi = 0.3
+    const trueVx = trueV * Math.cos(truePsi)
+    const trueVy = trueV * Math.sin(truePsi)
+    for (let i = 0; i < 50; i++) {
+      const t = i * 0.1
+      ekf.predict(0, 0, 0, 0.1, i)
+      ekf.updateGps(trueVx * t, trueVy * t, trueVx, trueVy, i)
+    }
+    const s = ekf.getState()
+    expect(s.x).toBeGreaterThan(40)
+    expect(s.y).toBeGreaterThan(10)
+    expect(Math.abs(s.psi - truePsi)).toBeLessThan(0.15)
+    expect(Math.abs(s.v - trueV)).toBeLessThan(0.8)
+  })
+
+  it('should track IMU-only stationary correctly with IMM enabled', () => {
+    const ekf = new SrEkf({
+      imm: { enabled: true },
+      processNoise: { position: 0, velocity: 0, heading: 0, accelBias: 0, gyroBias: 0 }
+    })
+    ekf.reset(100, 200, 0, 0)
+    for (let i = 0; i < 50; i++) {
+      ekf.predict(0, 0, 0, 0.01, i)
+    }
+    const s = ekf.getState()
+    expect(s.x).toBeCloseTo(100, 8)
+    expect(s.y).toBeCloseTo(200, 8)
+    expect(s.v).toBeCloseTo(0, 8)
   })
 })

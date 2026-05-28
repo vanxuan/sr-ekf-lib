@@ -1,5 +1,7 @@
 const N = 8;
 const M = 4;
+const PRE = M + N;
+const MAG_PRE = 1 + N;
 
 const enum I {
   X, Y, V, PSI, BETA, A_BIAS_X, A_BIAS_Y, G_BIAS_Z
@@ -43,6 +45,20 @@ export interface EkfConfig {
   gateThreshold?: number
   coastTimeoutMs?: number
   gpsTimeOffsetMs?: number
+  robustWeight?: {
+    enabled?: boolean
+    type?: 'huber' | 'cauchy'
+    threshold?: number
+  }
+  adaptiveNoise?: {
+    enabled?: boolean
+    smoothing?: number
+    maxScale?: number
+  }
+  imm?: {
+    enabled?: boolean
+    transitionMatrix?: number[][]
+  }
 }
 
 export interface NavigationSolution {
@@ -67,6 +83,8 @@ export interface EkfDiagnostics {
   walkLikelihood: number;
   stationary: boolean;
   magDeclination: number;
+  robustWeight: number;
+  adaNoiseScale: number;
 }
 
 const DEFAULTS = {
@@ -79,7 +97,10 @@ const DEFAULTS = {
   initialCovariance: { position: 100, velocity: 10, heading: Math.PI * Math.PI, sideslip: 0.25, accelBias: 0.1, gyroBias: 0.01 },
   gateThreshold: 9.488,
   coastTimeoutMs: 5000,
-  gpsTimeOffsetMs: 0
+  gpsTimeOffsetMs: 0,
+  robustWeight: { enabled: false, type: 'cauchy', threshold: 9.488 },
+  adaptiveNoise: { enabled: false, smoothing: 0.1, maxScale: 10 },
+  imm: { enabled: false, transitionMatrix: [[0.95, 0.05], [0.05, 0.95]] }
 };
 
 const EPS = 1e-6;
@@ -171,6 +192,15 @@ function matScale(A: Float64Array[], s: number): Float64Array[] {
   return C;
 }
 
+function traceOfP(S: Float64Array[]): number {
+  let t = 0;
+  for (let i = 0; i < S.length; i++) {
+    const Si = S[i];
+    for (let j = 0; j <= i; j++) t += Si[j] * Si[j];
+  }
+  return t;
+}
+
 function matTrace(A: Float64Array[]): number {
   const n = Math.min(A.length, A[0].length);
   let t = 0;
@@ -178,9 +208,9 @@ function matTrace(A: Float64Array[]): number {
   return t;
 }
 
-function matLowerToFull(L: Float64Array[]): Float64Array[] {
+function matLowerToFull(L: Float64Array[], out?: Float64Array[]): Float64Array[] {
   const n = L.length;
-  const P = matCreate(n, n);
+  const P = out ?? matCreate(n, n);
   for (let i = 0; i < n; i++)
     for (let j = 0; j <= i; j++) {
       let s = 0;
@@ -291,6 +321,15 @@ export class SrEkf {
   private tmpP: Float64Array[];
   private tmpInnov: Float64Array;
   private tmpWork4x4: Float64Array[];
+  private tmpSinv: Float64Array[];
+  private tmpQR: Float64Array[];
+  private tmpHouseV: Float64Array;
+  private tmpZ: Float64Array;
+  private tmpK: Float64Array[];
+  private tmpPreA: Float64Array[];
+  private tmpPreAT: Float64Array[];
+  private tmpMagHS: Float64Array;
+  private tmpMagAT: Float64Array[];
 
   private stepBuffer: number[] = [];
   private stepFreq: number = 0;
@@ -308,7 +347,19 @@ export class SrEkf {
   private lastMagBearing: number = 0;
   private lastMagTimeMs: number = 0;
   private deviceToEnu: Float64Array[] | null = null;
-  private positionFrozen: boolean = false;
+  private adaNoiseScale: number = 1;
+  private robustWeight: number = 1;
+
+  private xWalk: Float64Array;
+  private SWalk: Float64Array[];
+  private xDrive: Float64Array;
+  private SDrive: Float64Array[];
+  private modeProbs: Float64Array;
+  private transMatrix: Float64Array[];
+  private tmpP2: Float64Array[];
+  private tmpLikelihoods: Float64Array;
+  private tmpMixXWalk: Float64Array;
+  private tmpMixXDrive: Float64Array;
 
   constructor(config?: EkfConfig) {
     const wPN = { ...DEFAULTS.walkingProcessNoise, ...config?.walkingProcessNoise };
@@ -322,7 +373,10 @@ export class SrEkf {
       gateThreshold: config?.gateThreshold ?? DEFAULTS.gateThreshold,
       coastTimeoutMs: config?.coastTimeoutMs ?? DEFAULTS.coastTimeoutMs,
       gpsTimeOffsetMs: config?.gpsTimeOffsetMs ?? DEFAULTS.gpsTimeOffsetMs,
-      magneticDeclination: config?.magneticDeclination ?? DEFAULTS.magneticDeclination
+      magneticDeclination: config?.magneticDeclination ?? DEFAULTS.magneticDeclination,
+      robustWeight: { ...DEFAULTS.robustWeight, ...config?.robustWeight } as { enabled: boolean; type: 'huber' | 'cauchy'; threshold: number },
+      adaptiveNoise: { ...DEFAULTS.adaptiveNoise, ...config?.adaptiveNoise },
+      imm: { enabled: config?.imm?.enabled ?? DEFAULTS.imm.enabled, transitionMatrix: config?.imm?.transitionMatrix ?? DEFAULTS.imm.transitionMatrix }
     };
     this.magDeclination = this.config.magneticDeclination;
 
@@ -337,6 +391,29 @@ export class SrEkf {
     this.tmpP = matCreate(N, N);
     this.tmpInnov = new Float64Array(M);
     this.tmpWork4x4 = matCreate(M, M);
+    this.tmpSinv = matCreate(M, M);
+    this.tmpQR = matCreate(2 * N, N);
+    this.tmpHouseV = new Float64Array(2 * N);
+    this.tmpZ = new Float64Array(M);
+    this.tmpK = matCreate(N, M);
+    this.tmpPreA = matCreate(PRE, PRE);
+    this.tmpPreAT = matCreate(PRE, PRE);
+    this.tmpMagHS = new Float64Array(N);
+    this.tmpMagAT = matCreate(MAG_PRE, MAG_PRE);
+
+    this.xWalk = new Float64Array(N);
+    this.SWalk = matCreate(N, N);
+    this.xDrive = new Float64Array(N);
+    this.SDrive = matCreate(N, N);
+    this.modeProbs = new Float64Array(2);
+    this.modeProbs[0] = 0.5;
+    this.modeProbs[1] = 0.5;
+    this.transMatrix = matCreate(2, 2);
+    this.initTransMatrix();
+    this.tmpP2 = matCreate(N, N);
+    this.tmpLikelihoods = new Float64Array(2);
+    this.tmpMixXWalk = new Float64Array(N);
+    this.tmpMixXDrive = new Float64Array(N);
 
     this.reset(0, 0, 0, 0);
   }
@@ -389,6 +466,19 @@ export class SrEkf {
     this.lastMagBearing = 0;
     this.lastMagTimeMs = 0;
     this.deviceToEnu = null;
+    this.adaNoiseScale = 1;
+    this.robustWeight = 1;
+    for (let i = 0; i < N; i++) {
+      this.xWalk[i] = this.x[i];
+      this.xDrive[i] = this.x[i];
+    }
+    for (let i = 0; i < N; i++)
+      for (let j = 0; j < N; j++) {
+        this.SWalk[i][j] = this.S[i][j];
+        this.SDrive[i][j] = this.S[i][j];
+      }
+    this.modeProbs[0] = 0.5;
+    this.modeProbs[1] = 0.5;
   }
 
   private wrapAngle(a: number): number {
@@ -399,7 +489,7 @@ export class SrEkf {
   }
 
   setOrientation(azimuth: number, pitch: number, roll: number): void {
-    const ca = Math.cos(azimuth), sa = Math.sin(azimuth);
+    const ca = Math.cos(azimuth), sa = -Math.sin(azimuth);
     const cp = Math.cos(pitch), sp = Math.sin(pitch);
     const cr = Math.cos(roll), sr = Math.sin(roll);
     const R = matCreate(3, 3);
@@ -436,58 +526,134 @@ export class SrEkf {
     this.detectStationary();
     this.updateStepDetection(ax, dt);
 
-    if (this.config.mode === 'auto') {
-      this.computeWalkLikelihood(v, omega, gz, a, dt);
-      this.effectiveMode = this.walkLikelihood > 0.5 ? 'walk' : 'drive';
+    if (this.config.imm.enabled) {
+      this.immMix();
+
+      const runPredictForMode = (modeIdx: number): void => {
+        this.immSetMode(modeIdx);
+        const a_m = ax - this.x[I.A_BIAS_X];
+        const omega_m = gz - this.x[I.G_BIAS_Z];
+        const psi_m = this.x[I.PSI];
+        const beta_m = this.x[I.BETA];
+        const v_m = this.x[I.V];
+
+        this.computeQ(dt);
+        this.computeJacobian(a_m, omega_m, dt);
+
+        for (let i = 0; i < N; i++) {
+          for (let j = 0; j < N; j++) {
+            let s = 0;
+            for (let k = 0; k < N; k++) s += this.tmpF[i][k] * this.S[k][j];
+            this.tmpFS[i][j] = s;
+          }
+        }
+
+        for (let i = 0; i < N; i++) {
+          const row = this.tmpQR[i];
+          for (let j = 0; j < N; j++) row[j] = this.tmpFS[j][i];
+        }
+        for (let i = 0; i < N; i++) {
+          const dst = this.tmpQR[N + i];
+          const src = this.tmpSqrtQ[i];
+          for (let j = 0; j < N; j++) dst[j] = src[j];
+        }
+
+        this.qrInPlace(this.tmpQR, 2 * N, N, this.tmpHouseV);
+
+        for (let i = 0; i < N; i++) {
+          for (let j = 0; j <= i; j++) this.S[i][j] = this.tmpQR[j][i];
+          for (let j = i + 1; j < N; j++) this.S[i][j] = 0;
+        }
+
+        const psiBeta_m = psi_m + beta_m;
+        this.x[I.X] += this.ctraDeltaX(psiBeta_m, v_m, omega_m, dt);
+        this.x[I.Y] += this.ctraDeltaY(psiBeta_m, v_m, omega_m, dt);
+        this.x[I.V] = Math.max(0, this.x[I.V] + a_m * dt);
+        this.x[I.PSI] = this.wrapAngle(psi_m + omega_m * dt);
+        this.x[I.BETA] *= SIDESLIP_DECAY;
+
+        if (this.stationary) this.applyZupt();
+
+        this.immSaveMode(modeIdx);
+      };
+
+      runPredictForMode(0);
+      runPredictForMode(1);
+
+      if (!this.stationary && this.prevStationary) {
+        for (let modeIdx = 0; modeIdx < 2; modeIdx++) {
+          const S = modeIdx === 0 ? this.SWalk : this.SDrive;
+          for (let j = 0; j < N; j++) {
+            S[I.V][j] *= 5;
+            S[I.PSI][j] *= 5;
+            S[I.X][j] *= 5;
+            S[I.Y][j] *= 5;
+          }
+        }
+      }
+      this.prevStationary = this.stationary;
+
+      const mu0 = this.modeProbs[0];
+      const mu1 = this.modeProbs[1];
+      this.modeProbs[0] = this.transMatrix[0][0] * mu0 + this.transMatrix[1][0] * mu1;
+      this.modeProbs[1] = this.transMatrix[0][1] * mu0 + this.transMatrix[1][1] * mu1;
+
+      this.immRecombine();
     } else {
-      this.effectiveMode = this.config.mode;
-    }
-
-    this.computeQ(dt);
-
-    this.computeJacobian(a, omega, dt);
-
-    for (let i = 0; i < N; i++) {
-      for (let j = 0; j < N; j++) {
-        let s = 0;
-        for (let k = 0; k < N; k++) s += this.tmpF[i][k] * this.S[k][j];
-        this.tmpFS[i][j] = s;
+      if (this.config.mode === 'auto') {
+        this.computeWalkLikelihood(v, omega, gz, a, dt);
+        this.effectiveMode = this.walkLikelihood > 0.5 ? 'walk' : 'drive';
+      } else {
+        this.effectiveMode = this.config.mode;
       }
-    }
 
-    const mRows = 2 * N;
-    const M_qr: Float64Array[] = new Array(mRows);
-    for (let i = 0; i < N; i++) {
-      M_qr[i] = new Float64Array(N);
-      for (let j = 0; j < N; j++) M_qr[i][j] = this.tmpFS[j][i];
-    }
-    for (let i = 0; i < N; i++) M_qr[N + i] = new Float64Array(this.tmpSqrtQ[i]);
+      this.computeQ(dt);
+      this.computeJacobian(a, omega, dt);
 
-    const R = qrDecomposition(M_qr, mRows, N);
-
-    for (let i = 0; i < N; i++) {
-      for (let j = 0; j <= i; j++) this.S[i][j] = R[j][i];
-      for (let j = i + 1; j < N; j++) this.S[i][j] = 0;
-    }
-
-    const psiBeta = psi + beta;
-    this.x[I.X] += this.ctraDeltaX(psiBeta, v, omega, dt);
-    this.x[I.Y] += this.ctraDeltaY(psiBeta, v, omega, dt);
-    this.x[I.V] = Math.max(0, this.x[I.V] + a * dt);
-    this.x[I.PSI] = this.wrapAngle(psi + omega * dt);
-    this.x[I.BETA] *= SIDESLIP_DECAY;
-
-    if (this.stationary) {
-      this.applyZupt();
-    } else if (this.prevStationary) {
-      for (let j = 0; j < N; j++) {
-        this.S[I.V][j] *= 5;
-        this.S[I.PSI][j] *= 5;
-        this.S[I.X][j] *= 5;
-        this.S[I.Y][j] *= 5;
+      for (let i = 0; i < N; i++) {
+        for (let j = 0; j < N; j++) {
+          let s = 0;
+          for (let k = 0; k < N; k++) s += this.tmpF[i][k] * this.S[k][j];
+          this.tmpFS[i][j] = s;
+        }
       }
+
+      for (let i = 0; i < N; i++) {
+        const row = this.tmpQR[i];
+        for (let j = 0; j < N; j++) row[j] = this.tmpFS[j][i];
+      }
+      for (let i = 0; i < N; i++) {
+        const dst = this.tmpQR[N + i];
+        const src = this.tmpSqrtQ[i];
+        for (let j = 0; j < N; j++) dst[j] = src[j];
+      }
+
+      this.qrInPlace(this.tmpQR, 2 * N, N, this.tmpHouseV);
+
+      for (let i = 0; i < N; i++) {
+        for (let j = 0; j <= i; j++) this.S[i][j] = this.tmpQR[j][i];
+        for (let j = i + 1; j < N; j++) this.S[i][j] = 0;
+      }
+
+      const psiBeta = psi + beta;
+      this.x[I.X] += this.ctraDeltaX(psiBeta, v, omega, dt);
+      this.x[I.Y] += this.ctraDeltaY(psiBeta, v, omega, dt);
+      this.x[I.V] = Math.max(0, this.x[I.V] + a * dt);
+      this.x[I.PSI] = this.wrapAngle(psi + omega * dt);
+      this.x[I.BETA] *= SIDESLIP_DECAY;
+
+      if (this.stationary) {
+        this.applyZupt();
+      } else if (this.prevStationary) {
+        for (let j = 0; j < N; j++) {
+          this.S[I.V][j] *= 5;
+          this.S[I.PSI][j] *= 5;
+          this.S[I.X][j] *= 5;
+          this.S[I.Y][j] *= 5;
+        }
+      }
+      this.prevStationary = this.stationary;
     }
-    this.prevStationary = this.stationary;
   }
 
   private updateStepDetection(ax: number, dt: number): void {
@@ -573,7 +739,7 @@ export class SrEkf {
 
   private applyZupt(): void {
     const rVel = 0.01;
-    const rPos = 0.01;
+    const rPos = 1.0;
     const P = matLowerToFull(this.S);
 
     const innovV = 0 - this.x[I.V];
@@ -612,51 +778,105 @@ export class SrEkf {
     }
   }
 
-  updateMag(bearing: number, timestampMs: number): void {
-    this.lastImuTimeMs = timestampMs;
-    this.lastMagBearing = bearing;
-    this.lastMagTimeMs = timestampMs;
+  private qrInPlace(A: Float64Array[], m: number, n: number, vBuf: Float64Array): void {
+    for (let k = 0; k < Math.min(m, n); k++) {
+      let nrm = 0;
+      for (let i = k; i < m; i++) nrm += A[i][k] * A[i][k];
+      nrm = Math.sqrt(nrm);
+      if (nrm < 1e-15) continue;
+      const sign = A[k][k] >= 0 ? 1 : -1;
+      vBuf[0] = A[k][k] + sign * nrm;
+      const len = m - k;
+      for (let i = 1; i < len; i++) vBuf[i] = A[k + i][k];
+      let beta = 0;
+      for (let i = 0; i < len; i++) beta += vBuf[i] * vBuf[i];
+      beta = 2 / beta;
+      for (let j = k; j < n; j++) {
+        let s = 0;
+        for (let i = 0; i < len; i++) s += vBuf[i] * A[k + i][j];
+        s *= beta;
+        for (let i = 0; i < len; i++) A[k + i][j] -= s * vBuf[i];
+      }
+    }
+  }
 
+  private magUpdateSingle(bearing: number, timestampMs: number): number {
     const psiCov = this.S[I.PSI][I.PSI] * this.S[I.PSI][I.PSI];
-    if (psiCov > this.config.initialCovariance.heading! * 0.99) {
+    if (psiCov > this.config.initialCovariance.heading! * 0.99 && !this.config.imm.enabled) {
       this.x[I.PSI] = this.wrapAngle(bearing + this.magDeclination);
     }
 
     const psiMag = this.wrapAngle(bearing + this.magDeclination);
     const innov = this.wrapAngle(psiMag - this.x[I.PSI]);
-
     const r = this.config.measurementNoise.heading!;
-    const P = matLowerToFull(this.S);
 
-    let S = P[I.PSI][I.PSI] + r * r;
+    let psiVar = 0;
+    for (let k = 0; k <= I.PSI; k++) psiVar += this.S[I.PSI][k] * this.S[I.PSI][k];
     for (let i = 0; i < N; i++) {
-      this.x[i] += (P[i][I.PSI] / S) * innov;
+      let s = 0;
+      const lim = Math.min(i, I.PSI);
+      for (let k = 0; k <= lim; k++) s += this.S[i][k] * this.S[I.PSI][k];
+      this.tmpMagHS[i] = s;
+    }
+
+    const S = psiVar + r * r;
+    for (let i = 0; i < N; i++) {
+      this.x[i] += (this.tmpMagHS[i] / S) * innov;
     }
     this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
 
-    const H = new Float64Array(N);
-    H[I.PSI] = 1;
+    for (let i = 0; i < MAG_PRE; i++)
+      for (let j = 0; j < MAG_PRE; j++)
+        this.tmpMagAT[i][j] = 0;
 
-    const HS = new Float64Array(N);
-    for (let j = 0; j < N; j++) {
-      let s = 0;
-      for (let k = 0; k < N; k++) s += H[k] * this.S[k][j];
-      HS[j] = s;
-    }
-
-    const preSize = 1 + N;
-    const A = matCreate(preSize, preSize);
-    A[0][0] = r;
-    for (let j = 0; j < N; j++) A[0][1 + j] = HS[j];
+    this.tmpMagAT[0][0] = r;
+    for (let i = 0; i < N; i++) this.tmpMagAT[1 + i][0] = this.S[I.PSI][i];
     for (let i = 0; i < N; i++)
       for (let j = 0; j < N; j++)
-        A[1 + i][1 + j] = this.S[i][j];
+        this.tmpMagAT[1 + i][1 + j] = this.S[j][i];
 
-    const AT = matTranspose(A);
-    const R_qr = qrDecomposition(AT, preSize, preSize);
+    this.qrInPlace(this.tmpMagAT, MAG_PRE, MAG_PRE, this.tmpHouseV);
+
     for (let i = 0; i < N; i++) {
-      for (let j = 0; j <= i; j++) this.S[i][j] = R_qr[1 + j][1 + i];
+      for (let j = 0; j <= i; j++) this.S[i][j] = this.tmpMagAT[1 + j][1 + i];
       for (let j = i + 1; j < N; j++) this.S[i][j] = 0;
+    }
+
+    const normInnov = innov * innov / (psiVar + r * r);
+    return normInnov;
+  }
+
+  updateMag(bearing: number, timestampMs: number): void {
+    this.lastImuTimeMs = timestampMs;
+    this.lastMagBearing = bearing;
+    this.lastMagTimeMs = timestampMs;
+
+    if (this.config.imm.enabled) {
+      const magDeclination = this.magDeclination;
+      const r = this.config.measurementNoise.heading!;
+      const normInnovs: number[] = [];
+
+      for (let modeIdx = 0; modeIdx < 2; modeIdx++) {
+        this.immSetMode(modeIdx);
+        const ni = this.magUpdateSingle(bearing, timestampMs);
+        this.immSaveMode(modeIdx);
+        normInnovs.push(ni);
+      }
+
+      const l0 = Math.exp(-0.5 * normInnovs[0]);
+      const l1 = Math.exp(-0.5 * normInnovs[1]);
+      const c0 = this.transMatrix[0][0] * this.modeProbs[0] + this.transMatrix[1][0] * this.modeProbs[1];
+      const c1 = this.transMatrix[0][1] * this.modeProbs[0] + this.transMatrix[1][1] * this.modeProbs[1];
+      const w0 = l0 * c0;
+      const w1 = l1 * c1;
+      const sum = w0 + w1 + 1e-60;
+      this.modeProbs[0] = w0 / sum;
+      this.modeProbs[1] = w1 / sum;
+
+      this.walkLikelihood = this.modeProbs[0];
+      this.immRecombine();
+    } else {
+      this.magUpdateSingle(bearing, timestampMs);
     }
   }
 
@@ -669,7 +889,7 @@ export class SrEkf {
       for (let j = 0; j < N; j++)
         this.tmpSqrtQ[i][j] = 0;
 
-    if (this.config.mode === 'auto' && this.effectiveMode === 'drive' && this.walkLikelihood > 0.15) {
+    if (!this.config.imm.enabled && this.config.mode === 'auto' && this.effectiveMode === 'drive' && this.walkLikelihood > 0.15) {
       const pnDrive = this.config.processNoise;
       const pnWalk = this.config.walkingProcessNoise;
       const w = this.walkLikelihood;
@@ -756,7 +976,7 @@ export class SrEkf {
     this.tmpH[3][I.BETA] = v * cp;
   }
 
-  private computeInnovationAndChiSq(z: Float64Array): void {
+  private computeGpsInnovation(z: Float64Array): void {
     const x = this.x[I.X], y = this.x[I.Y], v = this.x[I.V], psi = this.x[I.PSI], beta = this.x[I.BETA];
     const psiBeta = psi + beta;
     this.tmpInnov[0] = z[0] - x;
@@ -776,22 +996,263 @@ export class SrEkf {
             s += H[i][k] * P[k][l] * H[j][l];
         this.tmpWork4x4[i][j] = s;
       }
+  }
 
-    const mn = this.config.measurementNoise;
-    const mp = mn.position!;
-    const mv = mn.velocity!;
-    this.tmpWork4x4[0][0] += mp * mp;
-    this.tmpWork4x4[1][1] += mp * mp;
-    this.tmpWork4x4[2][2] += mv * mv;
-    this.tmpWork4x4[3][3] += mv * mv;
+  private computeGpsPostFit(posR: number, velR: number): number {
+    this.tmpWork4x4[0][0] += posR * posR;
+    this.tmpWork4x4[1][1] += posR * posR;
+    this.tmpWork4x4[2][2] += velR * velR;
+    this.tmpWork4x4[3][3] += velR * velR;
 
     const S_inv = matInvert4x4(this.tmpWork4x4);
+    for (let i = 0; i < M; i++) this.tmpSinv[i].set(S_inv[i]);
 
     let chiSq = 0;
     for (let i = 0; i < M; i++)
       for (let j = 0; j < M; j++)
-        chiSq += this.tmpInnov[i] * S_inv[i][j] * this.tmpInnov[j];
+        chiSq += this.tmpInnov[i] * this.tmpSinv[i][j] * this.tmpInnov[j];
+    return chiSq;
+  }
+
+  private initTransMatrix(): void {
+    const tm = this.config.imm.transitionMatrix!;
+    for (let i = 0; i < 2; i++)
+      for (let j = 0; j < 2; j++)
+        this.transMatrix[i][j] = tm[i][j];
+  }
+
+  private immMix(): void {
+    const mu0 = this.modeProbs[0];
+    const mu1 = this.modeProbs[1];
+    const p00 = this.transMatrix[0][0];
+    const p01 = this.transMatrix[0][1];
+    const p10 = this.transMatrix[1][0];
+    const p11 = this.transMatrix[1][1];
+
+    const c0 = p00 * mu0 + p10 * mu1 + 1e-30;
+    const c1 = p01 * mu0 + p11 * mu1 + 1e-30;
+
+    const mu00 = p00 * mu0 / c0;
+    const mu10 = p10 * mu1 / c0;
+    const mu01 = p01 * mu0 / c1;
+    const mu11 = p11 * mu1 / c1;
+
+    for (let i = 0; i < N; i++) {
+      this.tmpMixXWalk[i] = mu00 * this.xWalk[i] + mu10 * this.xDrive[i];
+      this.tmpMixXDrive[i] = mu01 * this.xWalk[i] + mu11 * this.xDrive[i];
+    }
+
+    const Pw = matLowerToFull(this.SWalk, this.tmpP);
+    const Pd = matLowerToFull(this.SDrive, this.tmpP2);
+
+    for (let i = 0; i < N; i++) {
+      const dw0 = this.xWalk[i] - this.tmpMixXWalk[i];
+      const dd0 = this.xDrive[i] - this.tmpMixXWalk[i];
+      for (let j = 0; j < N; j++) {
+        const dw1 = this.xWalk[j] - this.tmpMixXWalk[j];
+        const dd1 = this.xDrive[j] - this.tmpMixXWalk[j];
+        this.tmpF[i][j] = mu00 * (Pw[i][j] + dw0 * dw1) + mu10 * (Pd[i][j] + dd0 * dd1);
+      }
+    }
+
+    for (let i = 0; i < N; i++) {
+      const dw0 = this.xWalk[i] - this.tmpMixXDrive[i];
+      const dd0 = this.xDrive[i] - this.tmpMixXDrive[i];
+      for (let j = 0; j < N; j++) {
+        const dw1 = this.xWalk[j] - this.tmpMixXDrive[j];
+        const dd1 = this.xDrive[j] - this.tmpMixXDrive[j];
+        this.tmpFS[i][j] = mu01 * (Pw[i][j] + dw0 * dw1) + mu11 * (Pd[i][j] + dd0 * dd1);
+      }
+    }
+
+    const Lw = cholDecomposition(this.tmpF);
+    for (let i = 0; i < N; i++)
+      for (let j = 0; j < N; j++)
+        this.SWalk[i][j] = Lw[i][j];
+    const Ld = cholDecomposition(this.tmpFS);
+    for (let i = 0; i < N; i++)
+      for (let j = 0; j < N; j++)
+        this.SDrive[i][j] = Ld[i][j];
+  }
+
+  private immSetMode(modeIdx: number): void {
+    const srcX = modeIdx === 0 ? this.tmpMixXWalk : this.tmpMixXDrive;
+    const srcS = modeIdx === 0 ? this.SWalk : this.SDrive;
+    for (let i = 0; i < N; i++) this.x[i] = srcX[i];
+    for (let i = 0; i < N; i++)
+      for (let j = 0; j < N; j++)
+        this.S[i][j] = srcS[i][j];
+    this.effectiveMode = modeIdx === 0 ? 'walk' : 'drive';
+  }
+
+  private immSaveMode(modeIdx: number): void {
+    const dstX = modeIdx === 0 ? this.xWalk : this.xDrive;
+    const dstS = modeIdx === 0 ? this.SWalk : this.SDrive;
+    for (let i = 0; i < N; i++) dstX[i] = this.x[i];
+    for (let i = 0; i < N; i++)
+      for (let j = 0; j < N; j++)
+        dstS[i][j] = this.S[i][j];
+  }
+
+  private immRecombine(): void {
+    const mu0 = this.modeProbs[0];
+    const mu1 = this.modeProbs[1];
+    for (let i = 0; i < N; i++) {
+      this.x[i] = mu0 * this.xWalk[i] + mu1 * this.xDrive[i];
+    }
+    const P_full = matLowerToFull(this.SWalk, this.tmpP);
+    const Pd = matLowerToFull(this.SDrive, this.tmpP2);
+    for (let i = 0; i < N; i++) {
+      const d0 = this.xWalk[i] - this.x[i];
+      const d1 = this.xDrive[i] - this.x[i];
+      for (let j = 0; j < N; j++) {
+        const d0j = this.xWalk[j] - this.x[j];
+        const d1j = this.xDrive[j] - this.x[j];
+        this.tmpF[i][j] = mu0 * (P_full[i][j] + d0 * d0j) + mu1 * (Pd[i][j] + d1 * d1j);
+      }
+    }
+    const L = cholDecomposition(this.tmpF);
+    for (let i = 0; i < N; i++)
+      for (let j = 0; j < N; j++)
+        this.S[i][j] = L[i][j];
+  }
+
+  private gpsUpdateSingle(posR: number, velR: number, x: number, y: number): boolean {
+    this.computeH();
+    this.computeGpsInnovation(this.tmpZ);
+
+    let chiSq = this.computeGpsPostFit(posR, velR);
     this.lastChiSq = chiSq;
+
+    const vSpeed = this.x[I.V];
+    if (chiSq > this.config.gateThreshold && vSpeed > 0.5) {
+      const psiBeta = this.x[I.PSI] + this.x[I.BETA];
+      const vxPred = vSpeed * Math.cos(psiBeta);
+      const vyPred = vSpeed * Math.sin(psiBeta);
+      const vxMeas = this.tmpZ[2];
+      const vyMeas = this.tmpZ[3];
+      const speedMeasSq = vxMeas * vxMeas + vyMeas * vyMeas;
+      if (speedMeasSq > 0.25) {
+        const dot = vxPred * vxMeas + vyPred * vyMeas;
+        if (dot < -0.5 * vSpeed * vSpeed) {
+          this.x[I.PSI] = this.wrapAngle(this.x[I.PSI] + Math.PI);
+          this.computeH();
+          this.computeGpsInnovation(this.tmpZ);
+          chiSq = this.computeGpsPostFit(posR, velR);
+          this.lastChiSq = chiSq;
+        }
+      }
+    }
+
+    let robustW = 1;
+    const rw = this.config.robustWeight;
+    if (rw.enabled) {
+      const thr = rw.threshold!;
+      if (rw.type === 'huber') {
+        robustW = chiSq > thr ? thr / chiSq : 1;
+      } else {
+        robustW = 1 / (1 + (chiSq / thr) * (chiSq / thr));
+      }
+    }
+
+    this.robustWeight = robustW;
+
+    let adaScale = 1;
+    if (this.config.adaptiveNoise.enabled) {
+      const innovRatio = chiSq / M;
+      const α = this.config.adaptiveNoise.smoothing!;
+      this.adaNoiseScale = α * Math.max(1, innovRatio) + (1 - α) * this.adaNoiseScale;
+      adaScale = Math.min(this.adaNoiseScale, this.config.adaptiveNoise.maxScale!);
+    }
+
+    const totalWeight = robustW / adaScale;
+    if (totalWeight < 1) {
+      this.tmpWork4x4[0][0] -= posR * posR;
+      this.tmpWork4x4[1][1] -= posR * posR;
+      this.tmpWork4x4[2][2] -= velR * velR;
+      this.tmpWork4x4[3][3] -= velR * velR;
+      posR /= Math.sqrt(totalWeight);
+      velR /= Math.sqrt(totalWeight);
+      chiSq = this.computeGpsPostFit(posR, velR);
+    }
+
+    if (!this.config.robustWeight.enabled && chiSq > this.config.gateThreshold) {
+      if (this.coasting) {
+        const gpsV = Math.sqrt(this.tmpZ[2] * this.tmpZ[2] + this.tmpZ[3] * this.tmpZ[3]);
+        const gpsPsi = Math.atan2(this.tmpZ[3], this.tmpZ[2]);
+        this.x[I.X] = this.tmpZ[0];
+        this.x[I.Y] = this.tmpZ[1];
+        this.x[I.V] = gpsV;
+        this.x[I.PSI] = this.wrapAngle(gpsPsi);
+        this.x[I.BETA] = 0;
+        const posSigma = Math.max(this.S[I.X][I.X], 7);
+        const velSigma = this.config.measurementNoise.velocity!;
+        const psiSigma = gpsV > 1 ? Math.min(velSigma / gpsV, 0.5) : 0.5;
+        for (let i = 0; i < N; i++) {
+          const lim = Math.min(i, I.BETA);
+          for (let j = 0; j <= lim; j++) this.S[i][j] = 0;
+        }
+        this.S[I.X][I.X] = posSigma;
+        this.S[I.Y][I.Y] = posSigma;
+        this.S[I.V][I.V] = velSigma;
+        this.S[I.PSI][I.PSI] = psiSigma;
+        this.S[I.BETA][I.BETA] = 0.1;
+        this.coasting = false;
+        return true;
+      }
+      return false;
+    }
+
+    const P = this.tmpP;
+    const H = this.tmpH;
+    const K = this.tmpK;
+    for (let i = 0; i < N; i++)
+      for (let j = 0; j < M; j++) {
+        let sum = 0;
+        for (let k = 0; k < N; k++)
+          for (let l = 0; l < M; l++)
+            sum += P[i][k] * H[l][k] * this.tmpSinv[l][j];
+        K[i][j] = sum;
+      }
+
+    for (let i = 0; i < N; i++)
+      for (let j = 0; j < M; j++)
+        this.x[i] += K[i][j] * this.tmpInnov[j];
+    this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
+    this.x[I.V] = Math.max(0, this.x[I.V]);
+
+    for (let i = 0; i < PRE; i++)
+      for (let j = 0; j < PRE; j++)
+        this.tmpPreA[i][j] = 0;
+
+    this.tmpPreA[0][0] = posR;
+    this.tmpPreA[1][1] = posR;
+    this.tmpPreA[2][2] = velR;
+    this.tmpPreA[3][3] = velR;
+
+    for (let i = 0; i < M; i++)
+      for (let j = 0; j < N; j++) {
+        let s = 0;
+        for (let k = 0; k < N; k++) s += H[i][k] * this.S[k][j];
+        this.tmpPreA[i][M + j] = s;
+      }
+
+    for (let i = 0; i < N; i++)
+      for (let j = 0; j < N; j++)
+        this.tmpPreA[M + i][M + j] = this.S[i][j];
+
+    for (let i = 0; i < PRE; i++)
+      for (let j = 0; j < PRE; j++)
+        this.tmpPreAT[i][j] = this.tmpPreA[j][i];
+
+    this.qrInPlace(this.tmpPreAT, PRE, PRE, this.tmpHouseV);
+
+    for (let i = 0; i < N; i++) {
+      for (let j = 0; j <= i; j++) this.S[i][j] = this.tmpPreAT[M + j][M + i];
+      for (let j = i + 1; j < N; j++) this.S[i][j] = 0;
+    }
+
+    return true;
   }
 
   updateGps(x: number, y: number, vx: number, vy: number, timestampMs: number, accuracyMeters?: number): boolean {
@@ -803,24 +1264,39 @@ export class SrEkf {
         this.x[I.V] = v;
         this.x[I.PSI] = this.wrapAngle(Math.atan2(vy, vx));
       }
+      if (this.config.imm.enabled) {
+        for (let i = 0; i < N; i++) {
+          this.xWalk[i] = this.x[i];
+          this.xDrive[i] = this.x[i];
+        }
+        for (let i = 0; i < N; i++)
+          for (let j = 0; j < N; j++) {
+            this.SWalk[i][j] = this.S[i][j];
+            this.SDrive[i][j] = this.S[i][j];
+          }
+      }
       this.gpsInitialized = true;
       this.lastGpsTimeMs = timestampMs + this.config.gpsTimeOffsetMs!;
       this.lastGatePassed = true;
       return true;
     }
 
-    const origPosR = this.config.measurementNoise.position;
-    const origVelR = this.config.measurementNoise.velocity;
+    const origPosR = this.config.measurementNoise.position!;
+    const origVelR = this.config.measurementNoise.velocity!;
+    let posR = origPosR;
+    let velR = origVelR;
     if (accuracyMeters !== undefined) {
-      const scale = Math.max(accuracyMeters / origPosR!, 0.1);
-      this.config.measurementNoise.position = origPosR! * scale;
-      this.config.measurementNoise.velocity = origVelR! * scale;
+      const scale = Math.max(accuracyMeters / origPosR, 0.1);
+      posR = origPosR * scale;
+      velR = origVelR * scale;
     }
 
-    if (this.config.mode === 'auto' && this.stepFreq >= 0.8 && this.stepFreq <= 3.5) {
-      const v = Math.sqrt(vx * vx + vy * vy);
-      if (v < 3.0) {
-        this.walkLikelihood = Math.min(0.95, this.walkLikelihood + 0.1);
+    if (!this.config.imm.enabled) {
+      if (this.config.mode === 'auto' && this.stepFreq >= 0.8 && this.stepFreq <= 3.5) {
+        const v = Math.sqrt(vx * vx + vy * vy);
+        if (v < 3.0) {
+          this.walkLikelihood = Math.min(0.95, this.walkLikelihood + 0.1);
+        }
       }
     }
 
@@ -831,159 +1307,85 @@ export class SrEkf {
       this.magDeclination += 0.05 * this.wrapAngle(observedDec - this.magDeclination);
     }
 
-    const z = new Float64Array([x, y, vx, vy]);
-    this.computeH();
-    this.computeInnovationAndChiSq(z);
+    this.tmpZ[0] = x; this.tmpZ[1] = y; this.tmpZ[2] = vx; this.tmpZ[3] = vy;
 
-    if (this.lastChiSq > this.config.gateThreshold) {
-      this.lastGatePassed = false;
-      if (accuracyMeters !== undefined) {
-        this.config.measurementNoise.position = origPosR;
-        this.config.measurementNoise.velocity = origVelR;
+    if (this.config.imm.enabled) {
+      const chiSqs: number[] = [];
+      const accepted: boolean[] = [];
+      for (let modeIdx = 0; modeIdx < 2; modeIdx++) {
+        this.immSetMode(modeIdx);
+        const ok = this.gpsUpdateSingle(posR, velR, x, y);
+        this.immSaveMode(modeIdx);
+        if (ok) {
+          chiSqs.push(this.lastChiSq);
+          accepted.push(true);
+        } else {
+          chiSqs.push(Infinity);
+          accepted.push(false);
+        }
       }
+
+      if (accepted[0] || accepted[1]) {
+        const l0 = chiSqs[0] < Infinity ? Math.exp(-0.5 * chiSqs[0]) : 0;
+        const l1 = chiSqs[1] < Infinity ? Math.exp(-0.5 * chiSqs[1]) : 0;
+        const c0 = this.transMatrix[0][0] * this.modeProbs[0] + this.transMatrix[1][0] * this.modeProbs[1];
+        const c1 = this.transMatrix[0][1] * this.modeProbs[0] + this.transMatrix[1][1] * this.modeProbs[1];
+        const w0 = l0 * c0;
+        const w1 = l1 * c1;
+        const sum = w0 + w1 + 1e-60;
+        this.modeProbs[0] = w0 / sum;
+        this.modeProbs[1] = w1 / sum;
+
+        this.walkLikelihood = this.modeProbs[0];
+      }
+
+      this.immRecombine();
+      this.lastGpsTimeMs = timestampMs + this.config.gpsTimeOffsetMs!;
+      this.lastGatePassed = accepted[0] || accepted[1];
+      return accepted[0] || accepted[1];
+    }
+
+    const result = this.gpsUpdateSingle(posR, velR, x, y);
+    if (result) {
+      this.lastGatePassed = true;
+      this.lastGpsTimeMs = timestampMs + this.config.gpsTimeOffsetMs!;
+    } else {
+      this.lastGatePassed = false;
       if (this.coasting) {
+        const gpsV = Math.sqrt(vx * vx + vy * vy);
+        const gpsPsi = Math.atan2(vy, vx);
         this.x[I.X] = x;
         this.x[I.Y] = y;
-        this.S[I.X][I.X] = Math.max(this.S[I.X][I.X], 7);
-        this.S[I.Y][I.Y] = Math.max(this.S[I.Y][I.Y], 7);
+        this.x[I.V] = gpsV;
+        this.x[I.PSI] = this.wrapAngle(gpsPsi);
+        this.x[I.BETA] = 0;
+        const posSigma = Math.max(this.S[I.X][I.X], 7);
+        const velSigma = this.config.measurementNoise.velocity!;
+        const psiSigma = gpsV > 1 ? Math.min(velSigma / gpsV, 0.5) : 0.5;
+        for (let i = 0; i < N; i++) {
+          const lim = Math.min(i, I.BETA);
+          for (let j = 0; j <= lim; j++) this.S[i][j] = 0;
+        }
+        this.S[I.X][I.X] = posSigma;
+        this.S[I.Y][I.Y] = posSigma;
+        this.S[I.V][I.V] = velSigma;
+        this.S[I.PSI][I.PSI] = psiSigma;
+        this.S[I.BETA][I.BETA] = 0.1;
         this.lastGpsTimeMs = timestampMs + this.config.gpsTimeOffsetMs!;
-        this.positionFrozen = false;
         this.coasting = false;
         this.lastGatePassed = true;
         return true;
       }
-      return false;
     }
-    this.lastGatePassed = true;
-    this.positionFrozen = false;
-    this.lastGpsTimeMs = timestampMs + this.config.gpsTimeOffsetMs!;
-
-    const P = this.tmpP;
-    const H = this.tmpH;
-
-    for (let i = 0; i < M; i++)
-      for (let j = 0; j < M; j++) {
-        let s = 0;
-        for (let k = 0; k < N; k++)
-          for (let l = 0; l < N; l++)
-            s += H[i][k] * P[k][l] * H[j][l];
-        this.tmpWork4x4[i][j] = s;
-      }
-
-    const mn = this.config.measurementNoise;
-    const mp2 = mn.position!;
-    const mv2 = mn.velocity!;
-    this.tmpWork4x4[0][0] += mp2 * mp2;
-    this.tmpWork4x4[1][1] += mp2 * mp2;
-    this.tmpWork4x4[2][2] += mv2 * mv2;
-    this.tmpWork4x4[3][3] += mv2 * mv2;
-
-    const S_inv = matInvert4x4(this.tmpWork4x4);
-
-    const K = matCreate(N, M);
-    for (let i = 0; i < N; i++)
-      for (let j = 0; j < M; j++) {
-        let sum = 0;
-        for (let k = 0; k < N; k++)
-          for (let l = 0; l < M; l++)
-            sum += P[i][k] * H[l][k] * S_inv[l][j];
-        K[i][j] = sum;
-      }
-
-    for (let i = 0; i < N; i++)
-      for (let j = 0; j < M; j++)
-        this.x[i] += K[i][j] * this.tmpInnov[j];
-    this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
-    this.x[I.V] = Math.max(0, this.x[I.V]);
-
-    const mnStd = this.config.measurementNoise;
-    const R_chol = matCreate(M, M);
-    R_chol[0][0] = mnStd.position!;
-    R_chol[1][1] = mnStd.position!;
-    R_chol[2][2] = mnStd.velocity!;
-    R_chol[3][3] = mnStd.velocity!;
-
-    const HS = matCreate(M, N);
-    for (let i = 0; i < M; i++)
-      for (let j = 0; j < N; j++) {
-        let s = 0;
-        for (let k = 0; k < N; k++) s += H[i][k] * this.S[k][j];
-        HS[i][j] = s;
-      }
-
-    const preSize = M + N;
-    const A = matCreate(preSize, preSize);
-    for (let i = 0; i < preSize; i++)
-      for (let j = 0; j < preSize; j++)
-        A[i][j] = 0;
-    matCopyBlock(R_chol, 0, 0, A, 0, 0, M, M);
-    matCopyBlock(HS, 0, 0, A, 0, M, M, N);
-    matCopyBlock(this.S, 0, 0, A, M, M, N, N);
-
-    const AT = matTranspose(A);
-    const R_qr = qrDecomposition(AT, preSize, preSize);
-
-    for (let i = 0; i < N; i++) {
-      for (let j = 0; j <= i; j++) this.S[i][j] = R_qr[M + j][M + i];
-      for (let j = i + 1; j < N; j++) this.S[i][j] = 0;
-    }
-
-    const gpsHeadingSpeed = Math.sqrt(vx * vx + vy * vy);
-    if (gpsHeadingSpeed > 0.5) {
-      const gpsHeading = Math.atan2(vy, vx);
-      const rH = 0.2 / Math.max(gpsHeadingSpeed, 0.5);
-      const psiBeta = this.x[I.PSI] + this.x[I.BETA];
-      const innovH = this.wrapAngle(gpsHeading - psiBeta);
-
-      const P_H = matLowerToFull(this.S);
-      const SH = P_H[I.PSI][I.PSI] + 2 * P_H[I.PSI][I.BETA] + P_H[I.BETA][I.BETA] + rH * rH;
-      for (let i = 0; i < N; i++) {
-        this.x[i] += ((P_H[i][I.PSI] + P_H[i][I.BETA]) / SH) * innovH;
-      }
-      this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
-
-      const HH = new Float64Array(N);
-      HH[I.PSI] = 1;
-      HH[I.BETA] = 1;
-      const HSH = new Float64Array(N);
-      for (let j = 0; j < N; j++) {
-        let s = 0;
-        for (let k = 0; k < N; k++) s += HH[k] * this.S[k][j];
-        HSH[j] = s;
-      }
-      const preH = 1 + N;
-      const AH = matCreate(preH, preH);
-      AH[0][0] = rH;
-      for (let j = 0; j < N; j++) AH[0][1 + j] = HSH[j];
-      for (let i = 0; i < N; i++)
-        for (let j = 0; j < N; j++)
-          AH[1 + i][1 + j] = this.S[i][j];
-      const AHT = matTranspose(AH);
-      const R_qrH = qrDecomposition(AHT, preH, preH);
-      for (let i = 0; i < N; i++) {
-        for (let j = 0; j <= i; j++) this.S[i][j] = R_qrH[1 + j][1 + i];
-        for (let j = i + 1; j < N; j++) this.S[i][j] = 0;
-      }
-    }
-
-    if (accuracyMeters !== undefined) {
-      this.config.measurementNoise.position = origPosR;
-      this.config.measurementNoise.velocity = origVelR;
-    }
-
-    return true;
+    return result;
   }
 
   coast(timeoutMs: number, currentTimeMs: number): boolean {
     if (currentTimeMs - this.lastGpsTimeMs > timeoutMs) {
       this.coasting = true;
-      const P = matLowerToFull(this.S);
-      const trace = matTrace(P);
-      if (trace > 10000) return false;
       return true;
     }
     this.coasting = false;
-    this.positionFrozen = false;
     return true;
   }
 
@@ -1000,9 +1402,8 @@ export class SrEkf {
   }
 
   getDiagnostics(): EkfDiagnostics {
-    const P = matLowerToFull(this.S);
     return {
-      trace: matTrace(P),
+      trace: traceOfP(this.S),
       gpsInnovation: [this.tmpInnov[0], this.tmpInnov[1], this.tmpInnov[2], this.tmpInnov[3]],
       gpsChiSq: this.lastChiSq,
       gatePassed: this.lastGatePassed,
@@ -1012,7 +1413,9 @@ export class SrEkf {
       mode: this.effectiveMode,
       walkLikelihood: this.walkLikelihood,
       stationary: this.stationary,
-      magDeclination: this.magDeclination
+      magDeclination: this.magDeclination,
+      robustWeight: this.robustWeight,
+      adaNoiseScale: this.adaNoiseScale
     };
   }
 }
