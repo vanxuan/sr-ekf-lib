@@ -945,6 +945,9 @@ export class SrEkf {
         const dot = vxPred * vxMeas + vyPred * vyMeas;
         if (dot < -0.5 * vSpeed * vSpeed) {
           this.x[I.PSI] = this.wrapAngle(this.x[I.PSI] + Math.PI);
+          for (let j = 0; j < I.PSI; j++) this.S[I.PSI][j] = 0;
+          for (let j = I.PSI + 1; j < N; j++) this.S[j][I.PSI] = 0;
+          this.S[I.PSI][I.PSI] = Math.max(this.S[I.PSI][I.PSI], 0.5);
           this.computeH();
           this.computeGpsInnovation(this.tmpZ);
           chiSq = this.computeGpsPostFit(posR, velR);
