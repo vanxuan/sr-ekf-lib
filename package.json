@@ -2,13 +2,27 @@
   "name": "sr-ekf",
   "version": "1.0.0",
   "description": "Production-grade Square-Root Extended Kalman Filter for IMU+GPS fusion",
-  "main": "src/sr-ekf.ts",
+  "type": "module",
+  "main": "./dist/sr-ekf.js",
+  "types": "./dist/sr-ekf.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/sr-ekf.js",
+      "types": "./dist/sr-ekf.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "build": "tsc",
     "benchmark": "vitest run --config vitest.benchmark.ts"
   },
   "devDependencies": {
+    "typescript": "^5.8.0",
     "vitest": "^3.1.3"
   }
 }
