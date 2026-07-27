@@ -64,7 +64,7 @@ else:
 v'  = v + a_forward·dt
 ψ'  = ψ + ω·dt·omegaScale, where omegaScale = (v==0) ? 1 : max(min(|v|/0.5, 1), stillness)
 β'  = β · exp(−dt/τ)   (mean-reversion toward 0)
-τ = |v| < 0.3 ? 0.1 : (|ω| > ε ? 1.5 : max(0.5, 1.5 − (|v|−1.5) / 3.5))
+τ = base × (1 − 0.6 × angAccelNorm), where base = |v| < 0.3 ? 0.1 : (|ω| > ε ? 1.5 : max(0.5, 1.5 − (|v|−1.5) / 3.5)), angAccelNorm = min(|dω/dt| / 3.0, 1)
 a_bias_x' = a_bias_x · exp(−dt/50)   (mean-reversion when accelEnergy < 0.05)
 g_bias_z' = g_bias_z   (random walk, corrected by ZARU during stationary)
 magDeclination' = magDeclination   (random walk)
@@ -156,10 +156,12 @@ EMA-tracked IMU energy metrics dynamically scale process noise:
 Scales applied multiplicatively to process noise diagonals:
 - Position: `1 + positionAccel × accelEnergy`
 - Velocity: `1 + velocityAccel × accelEnergy + velocityStep × stepEnergy`
-- Heading: `1 + headingGyro × gyroEnergy + headingStep × stepEnergy + 0.3 × accelEnergy` (accelEnergy term captures heading uncertainty from acceleration-induced body sway)
-- Sideslip: `1 + sideslipGyro × gyroEnergy + sideslipStep × stepEnergy`
+- Heading: `1 + headingGyro × gyroEnergy + headingStep × stepEnergy + 0.3 × accelEnergy + 1.5 × angAccelBoost` (accelEnergy captures body sway; angAccelBoost inflates Q during corner entry/exit transients)
+- Sideslip: `1 + sideslipGyro × gyroEnergy + sideslipStep × stepEnergy + 2.0 × angAccelBoost`
 - AccelBias: no scaling (pure random walk)
-- GyroBias: `× (1 + 0.3 × gyroEnergy)` (modest scaling — gyro energy increases yaw-rate uncertainty)
+- GyroBias: `× (1 + 0.3 × gyroEnergy + 0.5 × angAccelBoost)` (gyro energy increases yaw-rate uncertainty; angAccelBoost allows faster bias correction during transients)
+
+Where `angAccelBoost = min(|dω/dt| / 2.0, 1)` — ramps 0→1 for angular acceleration 0→2 rad/s². Zero on straights, full during corner entry/exit.
 
 Configurable via `adaptiveScaling` (defaults tuned for handheld/wearable):
 ```ts
@@ -199,9 +201,17 @@ Configurable via `adaptiveScaling` (defaults tuned for handheld/wearable):
 ### Sideslip Angle (β)
 - 6th state captures the difference between vehicle heading (ψ) and velocity direction (ψ+β)
 - Arises from tire slip during turns; GPS velocity direction vs gyro-integrated heading gives observability
-- Mean-reversion toward 0 with speed/yaw-rate-dependent time constant: `τ = |v| < 0.3 ? 0.1 : (|ω| > ε ? 1.5 : max(0.5, 1.5 − (|v|−1.5) / 3.5))` s — at |v|<0.3, collapses rapidly (0.1s) to prevent sideslip corrupting heading after a stop; long (1.5s) during turns to sustain drift angle; linearly interpolates from 1.5s at v=1.5 m/s to 0.5s at v≥5 m/s on straights. Jacobian `computeJacobian()` shares the same formula.
+- Mean-reversion toward 0 with speed/yaw-rate-dependent time constant: base `τ = |v| < 0.3 ? 0.1 : (|ω| > ε ? 1.5 : max(0.5, 1.5 − (|v|−1.5) / 3.5))` s, then multiplied by `(1 − 0.6 × angAccelNorm)` where `angAccelNorm = min(|dω/dt| / 3.0, 1)` — at max angular acceleration (3 rad/s²), τ drops to 40% of its base value (e.g. 1.5s → 0.6s during turns). This allows β to track the rapidly changing slip angle at corner entry/exit instead of lagging and corrupting heading. Jacobian `computeJacobian()` uses the same modulated τ.
 - Jacobian ∂/∂β = ∂/∂ψ (ψ and β appear symmetrically in position/velocity kinematics)
-- Process noise scaled by IMU energy (via adaptive scaling)
+- Process noise scaled by IMU energy and angular acceleration (via adaptive scaling)
+
+### Angular Acceleration Tracking (corner entry/exit transient detection)
+
+Tracks `|dω/dt|` (angular acceleration magnitude) by differencing consecutive bias-corrected gyro rates. Clamped to [0, 10] rad/s². Drives three mechanisms that prevent heading from "getting stuck" at corner transitions:
+
+1. **Q boost** (`angAccelBoost = min(|dω/dt|/2, 1)`): Inflates heading Q by ×(1+1.5·boost), sideslip Q by ×(1+2·boost), and gyro bias Q by ×(1+0.5·boost) during transients. Zero on straights, full at 2 rad/s². Allows faster state correction when the CTRA model is least accurate.
+2. **Faster β adaptation**: Modulates sideslip time constant by `(1 − 0.6·angAccelNorm)` where `angAccelNorm = min(|dω/dt|/3, 1)`. At max angular acceleration, β converges 2.5× faster (τ=0.6s vs 1.5s), preventing sideslip lag from corrupting heading during corner entry.
+3. **Gyro bias Q boost**: Extra process noise on gyro bias during transients allows GPS velocity direction to correct accumulated bias errors that would otherwise cause heading overshoot at corner exit.
 
 ### Speed-Scaled Process Noise
 - Position and velocity Q-diagonal entries auto-scale with speed:

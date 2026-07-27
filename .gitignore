@@ -2,6 +2,8 @@ node_modules
 dist
 *.log
 .opencode/
+vitest.benchmark.ts
+tests/benchmark.bench.ts
 
 # Analysis artifacts
 CHANGES-SUMMARY.txt

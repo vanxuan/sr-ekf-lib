@@ -168,6 +168,8 @@ export class SrEkf {
   private lastMagBearing = 0;
   private lastMagTimeMs = 0;
   private lastOmega = 0;             // bias-corrected gyro rate (rad/s) from the last predict()
+  private prevOmega = 0;             // omega from the previous predict() for angular acceleration
+  private angAccel = 0;              // |dω/dt| (rad/s²) — angular acceleration magnitude
   private lastPredictTimeMs = 0;
   private prevCallMagBearing = 0;     // compass bearing at the previous updateMag() call
   private prevCallMagTimeMs = 0;     // timestamp at the previous updateMag() call
@@ -254,6 +256,8 @@ export class SrEkf {
     this.lastMagBearing = 0;
     this.lastMagTimeMs = 0;
     this.lastOmega = 0;
+    this.prevOmega = 0;
+    this.angAccel = 0;
     this.lastPredictTimeMs = 0;
     this.prevCallMagBearing = 0;
     this.prevCallMagTimeMs = 0;
@@ -383,6 +387,13 @@ export class SrEkf {
     const psi = this.x[I.PSI], beta = this.x[I.BETA], v = this.x[I.V];
     const absV = Math.abs(v), absOmega = Math.abs(omega);
 
+    // Angular acceleration: |dω/dt| for transient detection (corner entry/exit)
+    if (this.lastPredictTimeMs > 0)
+      this.angAccel = Math.min(Math.abs(omega - this.prevOmega) / Math.max(dt, 1e-6), 10);
+    else
+      this.angAccel = 0;
+    this.prevOmega = omega;
+
     this.lastOmega = omega;
     this.lastPredictTimeMs = timestampMs;
     this.lastImuTimeMs = timestampMs;
@@ -391,9 +402,14 @@ export class SrEkf {
     this.computeAdaptiveQ(dt, a);
     const stillness = this.getStillness();
 
-    const betaTau = absV < 0.3 ? 0.1
+    // Sideslip time constant: shorter during angular transients (corner entry/exit)
+    // so β tracks the rapidly changing slip angle instead of lagging and corrupting ψ.
+    // At max angAccel (3 rad/s²), τ drops to 40% of its base value.
+    const angAccelNorm = Math.min(this.angAccel / 3.0, 1);
+    const betaTauBase = absV < 0.3 ? 0.1
       : absOmega > EPS ? 1.5
       : Math.max(0.5, 1.5 - (absV - 1.5) * (1.0 / 3.5));
+    const betaTau = betaTauBase * (1 - 0.6 * angAccelNorm);
     const expDt50 = Math.exp(-dt / 50);
     this.computeJacobian(a, omega, dt, betaTau, this.accelEnergy < 0.05 ? expDt50 : 1);
 
@@ -1199,11 +1215,15 @@ if (absOmega > EPS) {
     this.tmpSqrtQ[I.X][I.X] = Math.sqrt(qxx);
     this.tmpSqrtQ[I.Y][I.X] = qxy / Math.max(this.tmpSqrtQ[I.X][I.X], 1e-12);
     this.tmpSqrtQ[I.Y][I.Y] = Math.sqrt(Math.max(qyy - this.tmpSqrtQ[I.Y][I.X] * this.tmpSqrtQ[I.Y][I.X], 0));
+    // Angular acceleration Q boost: during corner entry/exit (high |dω/dt|), inflate
+    // heading/sideslip/gyroBias Q so the filter trusts its state less and allows faster
+    // GPS-driven correction. Prevents heading from "getting stuck" during transients.
+    const angAccelBoost = Math.min(this.angAccel / 2.0, 1);  // 0→1 for 0→2 rad/s²
     this.tmpSqrtQ[I.V][I.V] = pn.velocity! * sqrtDt * speedScale * (1 + sc.velocityAccel! * this.accelEnergy + sc.velocityStep! * stepEnergy);
-    this.tmpSqrtQ[I.PSI][I.PSI] = pn.heading! * sqrtDt * (1 + sc.headingGyro! * this.gyroEnergy + sc.headingStep! * stepEnergy + 0.3 * this.accelEnergy);
-    this.tmpSqrtQ[I.BETA][I.BETA] = pn.sideslip! * sqrtDt * (1 + sc.sideslipGyro! * this.gyroEnergy + sc.sideslipStep! * stepEnergy);
+    this.tmpSqrtQ[I.PSI][I.PSI] = pn.heading! * sqrtDt * (1 + sc.headingGyro! * this.gyroEnergy + sc.headingStep! * stepEnergy + 0.3 * this.accelEnergy + 1.5 * angAccelBoost);
+    this.tmpSqrtQ[I.BETA][I.BETA] = pn.sideslip! * sqrtDt * (1 + sc.sideslipGyro! * this.gyroEnergy + sc.sideslipStep! * stepEnergy + 2.0 * angAccelBoost);
     this.tmpSqrtQ[I.A_BIAS_X][I.A_BIAS_X] = pn.accelBias! * sqrtDt;
-    this.tmpSqrtQ[I.G_BIAS_Z][I.G_BIAS_Z] = pn.gyroBias! * sqrtDt * (1 + 0.3 * this.gyroEnergy);
+    this.tmpSqrtQ[I.G_BIAS_Z][I.G_BIAS_Z] = pn.gyroBias! * sqrtDt * (1 + 0.3 * this.gyroEnergy + 0.5 * angAccelBoost);
     this.tmpSqrtQ[I.MAG_DECL][I.MAG_DECL] = (pn.magDeclination ?? 1e-4) * sqrtDt;
   }
 
