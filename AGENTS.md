@@ -258,10 +258,22 @@ On the first `updateGps()` call after `reset()`, the filter snaps position direc
 
 ### Coast Recovery
 - When coasting and GPS gate rejects, `resetFromGps()` resets state + Cholesky from GPS fix directly; position σ capped at 5m via `min(current, 5)`
+- **Biases preserved across GPS re-acquisition**: `resetFromGps()` keeps the learned `aBiasX`, `gBiasZ`, and `magDeclination` values and their covariances — only kinematic states (x, y, v, ψ, β) are reset. This prevents tunnel exit from discarding the bias calibration learned during coasting via ZUPT/ZARU, eliminating the "fresh drift" symptom after GPS recovery.
 - Deduplicated from 3 copies into single private method
 - **Guard-inflation-masking reset**: If the outlier guard inflates `posR` by >3× (`posR / preGuardPosR > 3`) and the position jump is physically plausible (`dxNorm < dtSinceLastGps × 50 + 2`) and the device is genuinely moving (`|v| > 2.0 m/s`), the GPS fix is accepted directly via `resetFromGps()` — the inflated R would otherwise reduce Kalman gain to near-zero, causing minute-long convergence. At stationary, GPS position noise routinely exceeds the guard thresholds and resetFromGps would corrupt heading by setting psi = atan2(noisy v).
 - **Auto-divergence detection**: When NOT coasting and the previous GPS gate failed, if position error exceeds 10m (100 m²), the filter force-enters coasting to trigger a full reset on the next GPS fix — catches cases where a brief glitchy GPS kept lastGpsTimeMs alive but the state has clearly diverged (e.g. basement exit).
 - **Post-update large position reset**: After a successful GPS update, if the resulting position error exceeds 10km² (1e8 m²), a hard reset from GPS is applied — catches catastrophic Cholesky corruption
+
+### Tunnel Navigation (GPS-Denied Dead Reckoning)
+
+When GPS is lost (tunnel, parking garage, urban canyon), the filter transitions to pure IMU prediction with these aids:
+
+- **ZARU** continues firing during coasting — corrects gyro bias when the car is stopped or driving straight (`|ω| < 0.1`), maintaining heading accuracy through long tunnels
+- **Nonholonomic constraint** constrains β→0 during straight driving; **lateral acceleration constraint** constrains velocity during turns — both fire inside `predict()` regardless of GPS state
+- **Magnetometer** provides heading corrections at low speed (`|v| < 1.5` m/s) when stopped in a tunnel — `updateMag()` is independent of GPS
+- **Coasting Q reduction**: During coasting, position/velocity process noise is scaled to 30% (`COAST_Q_FACTOR = 0.3`) — without GPS corrections, bias-driven position error is already captured in P via cross-covariance; adding full Q over-inflates uncertainty. Heading/bias Q remain at full strength since ZARU/Mag still provide corrections
+- **Coast covariance cap**: Position σ capped at 500m, velocity σ at 50 m/s during coasting — prevents unbounded growth in very long tunnels (2+ minutes)
+- **Stale GPS speed decay**: After 10s of coasting, `lastGpsSpeed` decays toward 0 with 5s time constant — enables ZUPT to engage if the car stops in a tunnel (previously blocked permanently when GPS was lost at >2 m/s)
 
 ## Configuration
 

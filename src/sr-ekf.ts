@@ -357,6 +357,17 @@ export class SrEkf {
   predict(ax: number, ay: number, gz: number, dt: number, timestampMs: number, az?: number, gx?: number, gy?: number): void {
     if (dt <= 0) return;
     if (timestampMs <= this.lastImuTimeMs) return;
+    // During coasting (no GPS), decay lastGpsSpeed toward 0 so ZUPT can engage
+    // if the car stops in a tunnel.  Without this, a car that enters a tunnel at
+    // >2 m/s has gpsMoving=true forever, permanently blocking ZUPT.
+    if (this.coasting && this.lastGpsSpeed > 0) {
+      const coastMs = this.lastImuTimeMs - this.lastGpsTimeMs;
+      if (coastMs > 10000) {  // after 10s of no GPS, start decaying
+        const decay = Math.exp(-dt / 5);  // 5s time constant
+        this.lastGpsSpeed *= decay;
+        if (this.lastGpsSpeed < 0.1) this.lastGpsSpeed = 0;
+      }
+    }
     const rawAx = ax, rawAy = ay, rawGz = gz;
     const rawAz = az ?? 0, rawGx = gx ?? 0, rawGy = gy ?? 0;
     // When orientation alignment is active, a 6-axis IMU (including az) is
@@ -872,6 +883,25 @@ export class SrEkf {
         this.lastGpsTimeMs = 0;
       }
     }
+    // During coasting (no GPS), clamp Cholesky diagonal to prevent unbounded
+    // covariance growth in very long tunnels.  These are physical plausibility
+    // limits — position uncertainty beyond 500m or velocity uncertainty beyond
+    // 50 m/s is not useful and risks numerical degradation.
+    if (this.coasting) {
+      const MAX_POS_SIGMA = 500;
+      const MAX_VEL_SIGMA = 50;
+      if (this.S[I.X][I.X] > MAX_POS_SIGMA) this.S[I.X][I.X] = MAX_POS_SIGMA;
+      if (this.S[I.Y][I.Y] > MAX_POS_SIGMA) this.S[I.Y][I.Y] = MAX_POS_SIGMA;
+      if (this.S[I.V][I.V] > MAX_VEL_SIGMA) this.S[I.V][I.V] = MAX_VEL_SIGMA;
+      let tr = 0;
+      for (let i = 0; i < N; i++) {
+        for (let j = 0; j <= i; j++) {
+          const v = this.S[i][j];
+          tr += v * v;
+        }
+      }
+      this._traceCache = tr;
+    }
     if (!isFinite(this.adaNoiseScale) || this.adaNoiseScale < 0) this.adaNoiseScale = 1;
     if (!isFinite(this.robustWeight) || this.robustWeight < 0 || this.robustWeight > 1) this.robustWeight = 1;
   }
@@ -879,17 +909,30 @@ export class SrEkf {
   private resetFromGps(gpsX: number, gpsY: number, gpsVx: number, gpsVy: number): void {
     const gpsV = Math.sqrt(gpsVx * gpsVx + gpsVy * gpsVy);
     const gpsPsi = gpsV > 1e-6 ? Math.atan2(gpsVy, gpsVx) : 0;
+    // Preserve learned biases (aBiasX, gBiasZ) — they were calibrated during
+    // coasting via ZUPT/ZARU and resetting them to 0 would re-introduce the
+    // same systematic drift the filter had already corrected.  Only reset
+    // kinematic states that are directly observable from GPS.
+    const prevABiasX = this.x[I.A_BIAS_X];
+    const prevGBiasZ = this.x[I.G_BIAS_Z];
+    const prevDecl = this.x[I.MAG_DECL];
     this.x[I.X] = gpsX;
     this.x[I.Y] = gpsY;
     this.x[I.V] = gpsV;
     this.x[I.PSI] = this.wrapAngle(gpsPsi);
     this.x[I.BETA] = 0;
-    this.x[I.A_BIAS_X] = 0;
-    this.x[I.G_BIAS_Z] = 0;
-    const ic = this.config.initialCovariance;
+    this.x[I.A_BIAS_X] = prevABiasX;
+    this.x[I.G_BIAS_Z] = prevGBiasZ;
+    this.x[I.MAG_DECL] = prevDecl;
     const posSigma = Math.min(this.S[I.X][I.X], 5);
     const velSigma = this.config.measurementNoise.velocity!;
     const psiSigma = gpsV > 1 ? Math.min(velSigma / gpsV, 0.5) : 0.5;
+    // Preserve bias covariances — they reflect the filter's confidence in the
+    // learned bias values; resetting to initialCovariance would let them drift
+    // freely again, undoing the calibration.
+    const biasABSigma = this.S[I.A_BIAS_X][I.A_BIAS_X];
+    const biasGBSigma = this.S[I.G_BIAS_Z][I.G_BIAS_Z];
+    const declSigma = this.S[I.MAG_DECL][I.MAG_DECL];
     for (let i = 0; i < N; i++)
       for (let j = 0; j <= i; j++)
         this.S[i][j] = 0;
@@ -899,8 +942,9 @@ export class SrEkf {
     this.S[I.PSI][I.PSI] = psiSigma;
     this.S[I.PSI][I.V] = 0.3 * psiSigma;
     this.S[I.BETA][I.BETA] = 0.1;
-    this.S[I.A_BIAS_X][I.A_BIAS_X] = Math.sqrt(ic.accelBias!);
-    this.S[I.G_BIAS_Z][I.G_BIAS_Z] = Math.sqrt(ic.gyroBias!);
+    this.S[I.A_BIAS_X][I.A_BIAS_X] = biasABSigma;
+    this.S[I.G_BIAS_Z][I.G_BIAS_Z] = biasGBSigma;
+    this.S[I.MAG_DECL][I.MAG_DECL] = declSigma;
     this.coasting = false;
     this.bufTail = 0;
     this.bufLen = 0;
@@ -1225,6 +1269,19 @@ if (absOmega > EPS) {
     this.tmpSqrtQ[I.A_BIAS_X][I.A_BIAS_X] = pn.accelBias! * sqrtDt;
     this.tmpSqrtQ[I.G_BIAS_Z][I.G_BIAS_Z] = pn.gyroBias! * sqrtDt * (1 + 0.3 * this.gyroEnergy + 0.5 * angAccelBoost);
     this.tmpSqrtQ[I.MAG_DECL][I.MAG_DECL] = (pn.magDeclination ?? 1e-4) * sqrtDt;
+
+    // During coasting (no GPS corrections), reduce position/velocity Q to slow
+    // covariance growth.  Without GPS, bias-driven position error is already
+    // captured in P via the state cross-covariance; adding full Q on top
+    // over-inflates uncertainty.  Heading/bias Q are kept at full strength —
+    // ZARU/ZUPT/Mag still provide corrections in these channels.
+    if (this.coasting) {
+      const COAST_Q_FACTOR = 0.3;
+      this.tmpSqrtQ[I.X][I.X] *= COAST_Q_FACTOR;
+      this.tmpSqrtQ[I.Y][I.X] *= COAST_Q_FACTOR;
+      this.tmpSqrtQ[I.Y][I.Y] *= COAST_Q_FACTOR;
+      this.tmpSqrtQ[I.V][I.V] *= COAST_Q_FACTOR;
+    }
   }
 
   // ─── GPS measurement update ──────────────────────────────────────
