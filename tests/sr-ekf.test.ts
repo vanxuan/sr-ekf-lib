@@ -1278,4 +1278,27 @@ describe('SrEkf', () => {
     }
     expect(maxHeadingError * 180 / Math.PI).toBeLessThan(5.0)
   })
+
+  it('should track heading and velocity during walking with step-induced energy', () => {
+    const ekf = new SrEkf()
+    ekf.reset(0, 0, 0, 0)
+    const dt = 0.02
+    let time = 0, truePsi = 0.5, trueV = 1.3, trueX = 0, trueY = 0
+    let nextGpsTime = 0
+    for (let i = 0; i < 10 / dt; i++) {
+      const stepFreq = 2.0
+      const ax = 2.0 * Math.sin(2 * Math.PI * stepFreq * time)
+      ekf.predict(ax, 0, 0, dt, time * 1000)
+      trueX += trueV * Math.cos(truePsi) * dt
+      trueY += trueV * Math.sin(truePsi) * dt
+      time += dt
+      if (time >= nextGpsTime) {
+        ekf.updateGps(trueX, trueY, trueV * Math.cos(truePsi), trueV * Math.sin(truePsi), time * 1000)
+        nextGpsTime += 1.0
+      }
+    }
+    const s = ekf.getState()
+    expect(s.v).toBeCloseTo(trueV, 0.2)
+    expect(Math.abs((s.psi - truePsi + 3 * Math.PI) % (2 * Math.PI) - Math.PI)).toBeLessThan(0.1)
+  })
 })

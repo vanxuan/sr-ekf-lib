@@ -65,7 +65,7 @@ else:
 v'  = v + a_forward·dt
 ψ'  = ψ + ω̅·dt·omegaScale, where ω̅ = ½(ω_prev + ω_curr)
 β'  = β · exp(−dt/τ)   (mean-reversion toward 0)
-τ = base × (1 − 0.6 × angAccelNorm), where base = |v| < 0.3 ? 0.1 : (|ω| > ε ? 1.5 : max(0.5, 1.5 − (|v|−1.5) / 3.5)), angAccelNorm = min(|dω/dt| / 3.0, 1)
+τ = base × (1 − 0.6 × angAccelNorm) × (1 − 0.5 × stepEnergy), where base = |v| < 0.3 ? 0.1 : (|ω| > ε ? 1.5 : max(0.5, 1.5 − (|v|−1.5) / 3.5)), angAccelNorm = min(|dω/dt| / 3.0, 1)
 a_bias_x' = a_bias_x · exp(−dt/50)   (mean-reversion when accelEnergy < 0.05)
 g_bias_z' = g_bias_z   (random walk, corrected by ZARU during stationary)
 magDeclination' = magDeclination   (random walk)
@@ -168,7 +168,7 @@ Where `angAccelBoost = min(|dω/dt| / 2.0, 1)` — ramps 0→1 for angular accel
 Configurable via `adaptiveScaling` (defaults tuned for handheld/wearable):
 ```ts
 { positionAccel: 2.0, velocityAccel: 1.0, velocityStep: 2.5,
-  headingGyro: 0.5, headingStep: 0.5, sideslipGyro: 0.5, sideslipStep: 1.8 }
+  headingGyro: 0.5, headingStep: 1.5, sideslipGyro: 0.5, sideslipStep: 1.8 }
 ```
 
 ### Zero-Velocity Update (ZUPT)
@@ -232,7 +232,7 @@ Tracks `|dω/dt|` (angular acceleration magnitude) by differencing consecutive b
 Two defenses prevent position/heading jumps from noisy GPS in low-speed city environments:
 
 1. **Tighter position outlier guard**: Uses `maxPlausibleSpeed = max(2·|v|, 1) + 2` (instead of `max(v, 5) + 20`) with `×2` multiplier (instead of `×5`), capping inflation at 5× forward and 10× cross-track. At walking speed and 1 Hz GPS, a 5m jump inflates posR by 1.7×; a 20m jump inflates by 8.3×
-2. **Smooth heading gating**: GPS velocity heading correction ramps from 0 at v=0.5 to full via `headingGain = v < 0.5 ? 0 : min((v − 0.5 + gyroEnergy × 0.5) / 3.5, 1)`, applied to `H[2:3, PSI/BETA]`. The gyroEnergy term allows faster convergence when the device is actively turning (gyro confirms real motion). During the first 30 seconds after GPS initialization, an adaptive init boost further increases headingGain by up to 2× when heading uncertainty is high (`psiStd > 0.3 rad`), accelerating convergence from a cold start. Prevents hard-threshold discontinuity while still avoiding heading corruption from noisy GPS direction at near-zero speed. Position innovation still corrects heading through position-heading cross-covariance at all speeds
+2. **Smooth heading gating**: GPS velocity heading correction ramps from 0 at v=0.5 to full via `headingGain = v < 0.5 ? 0 : min((v − 0.5 + gyroEnergy × 0.5 + stepEnergy × 1.5) / 3.5, 1)`, applied to `H[2:3, PSI/BETA]`. The gyroEnergy and stepEnergy terms allow faster convergence when the device is actively turning or walking (confirms real motion). During the first 30 seconds after GPS initialization, an adaptive init boost further increases headingGain by up to 2× when heading uncertainty is high (`psiStd > 0.3 rad`), accelerating convergence from a cold start. Prevents hard-threshold discontinuity while still avoiding heading corruption from noisy GPS direction at near-zero speed. Position innovation still corrects heading through position-heading cross-covariance at all speeds
 3. **GPS heading init gate lowered** (line 357): `spd > 0.1` — catches even very slow movement for heading initialization from GPS velocity direction
  4. **180° flip recovery gate relaxed** (src/sr-ekf.ts `gpsUpdateSingle`): now fires on anti-parallel GPS velocity (`dot < -0.5·v²`) whenever `v > 0.8`, with **no position-χ² gate requirement** (previously required `chiSq > gateThreshold`). The strict anti-parallel dot-product check still prevents misfire on 90° pedestrian turns (which only trigger at >120° separation). This catches pure velocity-direction reversals — e.g. urban Doppler multipath or a U-turn where position stays consistent but velocity flips — which previously were not corrected and resolved into a negative-v state. A post-update backstop then reparameterizes any residual `v < 0` into the `(−v, ψ+π, β+π)` branch so `v ≥ 0` always holds with `ψ` = direction of motion. The backstop only reparameterizes when `|v| ≥ 0.5 m/s`; at negligible speed (stationary device) it merely clamps `v` to 0 without flipping ψ. Otherwise, GPS velocity *noise* at rest drives `v` to tiny negative values and the π-flip would make the heading shake 180° every step.
 5. **Rest-weighted velocity H blocking**: When IMU energy is near zero (`accelEnergy + gyroEnergy < 0.05`), the GPS velocity heading columns (`H[2:3][PSI/BETA]`) are smoothly reduced by a speed-dependent factor `(1 − restW)` where `restW = clamp((1.5 − |v|) / 1.0, 0, 1)`. At rest this completely blocks GPS velocity from rotating ψ, handing authority to the magnetometer. At speed the blocking fades, allowing GPS velocity direction to own heading.

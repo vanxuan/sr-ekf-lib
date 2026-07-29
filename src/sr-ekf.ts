@@ -46,7 +46,7 @@ const DEFAULTS = {
   gateThreshold: 9.488, coastTimeoutMs: 5000, gpsTimeOffsetMs: 0,
   robustWeight: { enabled: true, type: 'huber', threshold: 9.488 },
   adaptiveNoise: { enabled: false, smoothing: 0.1, maxScale: 3 },
-  adaptiveScaling: { positionAccel: 2.0, velocityAccel: 1.0, velocityStep: 2.5, headingGyro: 0.5, headingStep: 0.5, sideslipGyro: 0.5, sideslipStep: 1.8 },
+  adaptiveScaling: { positionAccel: 2.0, velocityAccel: 1.0, velocityStep: 2.5, headingGyro: 0.5, headingStep: 1.5, sideslipGyro: 0.5, sideslipStep: 1.8 },
   useLateralAccel: true
 };
 
@@ -105,6 +105,7 @@ export class SrEkf {
   private gyroEnergy = 0;
   private varAccelEnergy = 0;
   private varGyroEnergy = 0;
+  private stepEnergy = 0;
   private _accel3DVar = 0;
   private _gyro3DEnergy = 0;
   private magRejectCount = 0;
@@ -441,7 +442,7 @@ export class SrEkf {
     const betaTauBase = absV < 0.3 ? 0.1
       : absOmega > EPS ? 1.5
       : Math.max(0.5, 1.5 - (absV - 1.5) * (1.0 / 3.5));
-    const betaTau = betaTauBase * (1 - 0.6 * angAccelNorm);
+    const betaTau = betaTauBase * (1 - 0.6 * angAccelNorm) * (1 - 0.5 * this.stepEnergy);
     const expDt50 = Math.exp(-dt / 50);
     this.computeJacobian(a, omegaAvg, dt, betaTau, this.accelEnergy < 0.05 ? expDt50 : 1);
 
@@ -1418,7 +1419,8 @@ if (absOmega > EPS) {
     this.gyroEnergy = 0.9 * this.gyroEnergy + 0.1 * Math.min(rawGyro, 5);
     this.varGyroEnergy = 0.9 * this.varGyroEnergy + 0.1 * Math.min(rawGyro, 5);
 
-    const stepEnergy = Math.min(this.stepFreq / 3, 1);
+    this.stepEnergy = Math.min(this.stepFreq / 3, 1);
+    const stepEnergy = this.stepEnergy;
     const sc = this.config.adaptiveScaling;
 
     const pn = this.config.processNoise;
@@ -1480,7 +1482,7 @@ if (absOmega > EPS) {
     // documented feature. In practice low-speed GPS-velocity heading jitter is already
     // negligible when a magnetometer is present (the mag owns heading there), and the
     // per-component velRobustW + stationary decouple further suppress noisy Doppler.
-    let headingGain = v < 0.5 ? 0 : Math.min((v - 0.5 + this.gyroEnergy * 0.5) / 3.5, 1);
+    let headingGain = v < 0.5 ? 0 : Math.min((v - 0.5 + this.gyroEnergy * 0.5 + this.stepEnergy * 1.5) / 3.5, 1);
 
     // Adaptive initialization boost: during first 30s after GPS init, if heading
     // variance is high, temporarily boost GPS correction to accelerate convergence.
