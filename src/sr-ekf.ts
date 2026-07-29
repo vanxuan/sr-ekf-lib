@@ -179,6 +179,12 @@ export class SrEkf {
   private curAzimuth = NaN;
   private curPitch = NaN;
   private curRoll = NaN;
+  // ─── Velocity prior (coasting speed anchor) ───────────────────
+  private coastSpeed = 0;            // speed at GPS loss — soft prior target during coasting
+  private coastSpeedReady = false;   // true once coastSpeed has been captured
+  // ─── Barometric altitude tracking ─────────────────────────────
+  private lastBaroAlt = NaN;         // last barometric altitude (m)
+  private lastBaroTimeMs = 0;        // last barometer timestamp (ms)
   private adaNoiseScale = 1;
   private adaConvergeCount = 0;
   private _traceCache = 0;
@@ -272,6 +278,10 @@ export class SrEkf {
     this.robustWeight = 1;
     this._zuptEngaged = false;
     this._wasZuptEngaged = false;
+    this.coastSpeed = 0;
+    this.coastSpeedReady = false;
+    this.lastBaroAlt = NaN;
+    this.lastBaroTimeMs = 0;
     this.bufTail = 0;
     this.bufLen = 0;
     this.imuTS.clear();
@@ -357,16 +367,24 @@ export class SrEkf {
   predict(ax: number, ay: number, gz: number, dt: number, timestampMs: number, az?: number, gx?: number, gy?: number): void {
     if (dt <= 0) return;
     if (timestampMs <= this.lastImuTimeMs) return;
-    // During coasting (no GPS), decay lastGpsSpeed toward 0 so ZUPT can engage
-    // if the car stops in a tunnel.  Without this, a car that enters a tunnel at
-    // >2 m/s has gpsMoving=true forever, permanently blocking ZUPT.
+    // During coasting (no GPS), immediately decay lastGpsSpeed toward 0 so ZUPT
+    // can engage if the car stops in a tunnel/basement.  Without this, a car that
+    // enters a basement at >2 m/s has gpsMoving=true forever, permanently
+    // blocking ZUPT — the car icon "shoots forward" because velocity persists.
+    // Decay starts immediately (no delay) with 2s time constant for fast response.
     if (this.coasting && this.lastGpsSpeed > 0) {
-      const coastMs = this.lastImuTimeMs - this.lastGpsTimeMs;
-      if (coastMs > 10000) {  // after 10s of no GPS, start decaying
-        const decay = Math.exp(-dt / 5);  // 5s time constant
-        this.lastGpsSpeed *= decay;
-        if (this.lastGpsSpeed < 0.1) this.lastGpsSpeed = 0;
-      }
+      const decay = Math.exp(-dt / 2);
+      this.lastGpsSpeed *= decay;
+      if (this.lastGpsSpeed < 0.1) this.lastGpsSpeed = 0;
+    }
+    // Capture speed at GPS loss as the velocity prior target.  This must happen
+    // BEFORE lastGpsSpeed decays to 0.  The prior pulls v toward coastSpeed
+    // during continuous-motion coasting (e.g. driving underground), preventing
+    // accel bias drift from integrating into velocity error.
+    if (this.coasting && !this.coastSpeedReady && this.gpsInitialized) {
+      this.coastSpeed = Math.abs(this.x[I.V]);
+      if (this.coastSpeed < 0.5) this.coastSpeed = 0;  // was stationary — no prior needed
+      this.coastSpeedReady = true;
     }
     const rawAx = ax, rawAy = ay, rawGz = gz;
     const rawAz = az ?? 0, rawGx = gx ?? 0, rawGy = gy ?? 0;
@@ -395,14 +413,17 @@ export class SrEkf {
     }
     const a = ax - this.x[I.A_BIAS_X];
     const omega = gz - this.x[I.G_BIAS_Z];
+    const oldOmega = this.prevOmega;
     const psi = this.x[I.PSI], beta = this.x[I.BETA], v = this.x[I.V];
     const absV = Math.abs(v), absOmega = Math.abs(omega);
 
     // Angular acceleration: |dω/dt| for transient detection (corner entry/exit)
     if (this.lastPredictTimeMs > 0)
-      this.angAccel = Math.min(Math.abs(omega - this.prevOmega) / Math.max(dt, 1e-6), 10);
+      this.angAccel = Math.min(Math.abs(omega - oldOmega) / Math.max(dt, 1e-6), 10);
     else
       this.angAccel = 0;
+
+    const omegaAvg = (this.lastPredictTimeMs > 0) ? 0.5 * (oldOmega + omega) : omega;
     this.prevOmega = omega;
 
     this.lastOmega = omega;
@@ -410,7 +431,7 @@ export class SrEkf {
     this.lastImuTimeMs = timestampMs;
     this.updateImuWindow(ax, ay, gz, az, gx, gy, timestampMs);
     this.updateStepDetection(ax, timestampMs);
-    this.computeAdaptiveQ(dt, a);
+    this.computeAdaptiveQ(dt, a, omega);
     const stillness = this.getStillness();
 
     // Sideslip time constant: shorter during angular transients (corner entry/exit)
@@ -422,7 +443,7 @@ export class SrEkf {
       : Math.max(0.5, 1.5 - (absV - 1.5) * (1.0 / 3.5));
     const betaTau = betaTauBase * (1 - 0.6 * angAccelNorm);
     const expDt50 = Math.exp(-dt / 50);
-    this.computeJacobian(a, omega, dt, betaTau, this.accelEnergy < 0.05 ? expDt50 : 1);
+    this.computeJacobian(a, omegaAvg, dt, betaTau, this.accelEnergy < 0.05 ? expDt50 : 1);
 
     for (let i = 0; i < N; i++)
       for (let j = 0; j < N; j++) {
@@ -445,17 +466,17 @@ export class SrEkf {
 
     const psiBeta = psi + beta;
     const vAvg = v + 0.5 * a * dt;
-    const [dx, dy] = this.ctraDelta(psiBeta, vAvg, omega, dt);
+    const [dx, dy] = this.ctraDelta(psiBeta, vAvg, omegaAvg, dt);
     this.x[I.X] += dx;
     this.x[I.Y] += dy;
     this.x[I.V] = Math.max(0, v + a * dt);
     const vehMoving = Math.min(absV / 0.5, 1);
     const omegaScale = vehMoving > 0 ? Math.max(vehMoving, stillness) : 1;
-    this.x[I.PSI] = this.wrapAngle(psi + omega * dt * omegaScale);
+    this.x[I.PSI] = this.wrapAngle(psi + omegaAvg * dt * omegaScale);
     this.x[I.BETA] *= Math.exp(-dt / betaTau);
     // A_BIAS_X updated only via GPS velocity corrections (no decay needed)
 
-    if (this.config.useLateralAccel && !this.deviceToEnu && absOmega > 0.1 && absV > 0.2)
+    if (this.config.useLateralAccel && absOmega > 0.1 && absV > 0.2)
       this.applyLateralAccel(ay, omega);
     else if (absOmega < 0.1 && absV > 0.15)
       this.applyNonholonomic(omega);
@@ -503,6 +524,82 @@ export class SrEkf {
       si[I.Y][I.Y] = Math.max(si[I.Y][I.Y], 3);
       si[I.PSI][I.PSI] = Math.max(si[I.PSI][I.PSI], 0.3);
     }
+    // Velocity damping during coasting: when GPS is lost and the car appears
+    // stationary (low IMU energy), inject a soft pseudo-measurement v ≈ 0 via
+    // scalar QR.  This prevents the "car icon shoots forward" symptom — without
+    // GPS, uncorrected accel bias integrates into velocity and position.  The
+    // measurement noise tightens over time (loose initially, tight after 30s) so
+    // genuine motion is preserved but stopped cars converge to v = 0.
+    if (this.coasting && !this._zuptEngaged) {
+      const coastTimeS = Math.max(0, (this.lastImuTimeMs - this.lastGpsTimeMs)) / 1000;
+      const stationarity = this.accelEnergy + this.gyroEnergy;
+      if (coastTimeS > 3 && stationarity < 0.1 && Math.abs(this.x[I.V]) > 0.05) {
+        const rDamp = Math.max(0.05, 10.0 / Math.max(coastTimeS, 1));
+        const innov = -this.x[I.V];
+        const SV = this.S[I.V];
+        let sInnov = rDamp * rDamp;
+        for (let j = 0; j < N; j++) sInnov += SV[j] * SV[j];
+        for (let i = 0; i < N; i++) {
+          let p = 0;
+          const lim = Math.min(i, I.V);
+          for (let k = 0; k <= lim; k++) p += this.S[i][k] * SV[k];
+          this.x[i] += p / sInnov * innov;
+        }
+        this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
+        // QR covariance update: S ← QR([R_damp, 0; H·S, S]) extracting S from lower-right
+        const qr = this.tmpLatPre;
+        for (let i = 0; i <= N; i++) for (let j = 0; j < N; j++) qr[i][j] = 0;
+        qr[0][0] = rDamp;
+        for (let j = 0; j < N; j++) qr[1][j] = SV[j];
+        for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) qr[i + 1][j] = this.S[i][j];
+        this.qrInPlace(qr, N + 1, N, this.tmpHouseV);
+        for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) this.S[i][j] = qr[i + 1][j];
+        ensureDiag(this.S);
+        let tr = 0;
+        for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) { const v = this.S[i][j]; tr += v * v; }
+        this._traceCache = tr;
+      }
+    }
+    // Velocity prior during coasting: when GPS is lost and the car is moving
+    // (stationarity check fails), pull v toward coastSpeed (the speed at GPS
+    // loss) to prevent accel bias from integrating into velocity drift.  The
+    // prior strength decays exponentially — tight early (strong anchor), loose
+    // after ~30s (car may have turned/stopped).  This addresses the multi-
+    // basement scenario where continuous motion without GPS causes v to drift
+    // ~0.6 m/s per 60s from uncorrected aBiasX.
+    if (this.coasting && this.coastSpeedReady && this.coastSpeed > 0) {
+      const coastTimeS = Math.max(0, (this.lastImuTimeMs - this.lastGpsTimeMs)) / 1000;
+      const stationarity = this.accelEnergy + this.gyroEnergy;
+      // Only fire when car is genuinely moving (not stopped — ZUPT handles that)
+      if (stationarity > 0.05 || Math.abs(this.x[I.V]) > 0.5) {
+        // Prior R grows with coast time: tight at onset (R=2), loose after 30s (R≈20)
+        const rPrior = Math.min(2.0 + coastTimeS * 0.6, 20.0);
+        const innov = this.x[I.V] - this.coastSpeed;
+        const SV = this.S[I.V];
+        let sInnov = rPrior * rPrior;
+        for (let j = 0; j < N; j++) sInnov += SV[j] * SV[j];
+        for (let i = 0; i < N; i++) {
+          let p = 0;
+          const lim = Math.min(i, I.V);
+          for (let k = 0; k <= lim; k++) p += this.S[i][k] * SV[k];
+          this.x[i] += p / sInnov * innov;
+        }
+        this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
+        // QR covariance update
+        const qr = this.tmpLatPre;
+        for (let i = 0; i <= N; i++) for (let j = 0; j < N; j++) qr[i][j] = 0;
+        qr[0][0] = rPrior;
+        for (let j = 0; j < N; j++) qr[1][j] = SV[j];
+        for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) qr[i + 1][j] = this.S[i][j];
+        this.qrInPlace(qr, N + 1, N, this.tmpHouseV);
+        for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) this.S[i][j] = qr[i + 1][j];
+        ensureDiag(this.S);
+        let tr = 0;
+        for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) { const v = this.S[i][j]; tr += v * v; }
+        this._traceCache = tr;
+      }
+    }
+
     // ZARU runs independently of ZUPT (gated on |omega| inside the method) so
     // gyro bias is corrected even when GPS-moving disables ZUPT.
     this.applyZaru(omega);
@@ -525,6 +622,7 @@ export class SrEkf {
       this.gpsInitTimeMs = timestampMs;
       this.lastGpsTimeMs = timestampMs + this.config.gpsTimeOffsetMs!;
       this.lastGatePassed = true;
+      this.coastSpeedReady = false;  // reset velocity prior on GPS (re)init
       // Tighten covariance to reflect GPS-derived position/velocity knowledge.
       // Without this, S[X][X]=10 (σ=10m) lets IMU drift accumulate rapidly
       // between GPS fixes, causing the outlier guard to reject valid fixes.
@@ -713,6 +811,80 @@ export class SrEkf {
     if (replayCount > 0) this.replayFromScratch(replayCount);
 
     return result;
+  }
+
+  // ─── Barometric altitude update ──────────────────────────────
+  // Uses the phone's barometer to constrain forward speed on ramps via the
+  // relationship vz = v × sin(pitch).  When |sin(pitch)| > 0.03 (≥ 1.7° grade,
+  // typical of parking ramps), a scalar QR pseudo-measurement injects
+  // v = vz_measured / sin(pitch) with noise reflecting barometer accuracy.
+  //
+  // On flat ground (|sin(pitch)| ≤ 0.03) the barometer provides no speed
+  // information and the update is skipped.  When device orientation is not set
+  // (deviceToEnu === null), pitch is unknown so the update is also skipped.
+  //
+  // This addresses the multi-basement scenario where continuous ramp driving
+  // without GPS causes velocity drift from uncorrected accel bias.  The
+  // barometric constraint is most effective on ramps (pitch 3–9°) where the
+  // altitude change rate provides a strong speed observable.
+  updateBaro(altitude: number, timestampMs: number): void {
+    if (!this.gpsInitialized || !isFinite(altitude)) return;
+    if (!this.coasting) { this.lastBaroAlt = altitude; this.lastBaroTimeMs = timestampMs; return; }
+    if (!isFinite(this.lastBaroAlt) || timestampMs <= this.lastBaroTimeMs) {
+      this.lastBaroAlt = altitude;
+      this.lastBaroTimeMs = timestampMs;
+      return;
+    }
+    const dtBaro = (timestampMs - this.lastBaroTimeMs) / 1000;
+    if (dtBaro < 0.05 || dtBaro > 5) { this.lastBaroAlt = altitude; this.lastBaroTimeMs = timestampMs; return; }
+    // Need pitch estimate — only available when device orientation is set
+    const pitch = this.curPitch;
+    if (!isFinite(pitch)) { this.lastBaroAlt = altitude; this.lastBaroTimeMs = timestampMs; return; }
+    const sinPitch = Math.sin(pitch);
+    if (Math.abs(sinPitch) < 0.03) {
+      // On flat ground — barometer gives no speed information
+      this.lastBaroAlt = altitude;
+      this.lastBaroTimeMs = timestampMs;
+      return;
+    }
+    // Vertical velocity from barometer (positive = ascending)
+    const vzMeasured = (altitude - this.lastBaroAlt) / dtBaro;
+    this.lastBaroAlt = altitude;
+    this.lastBaroTimeMs = timestampMs;
+    // Observation model: vz = v × sin(pitch)  →  H[V] = sin(pitch)
+    // Measurement noise: barometer σ ≈ 0.5m → for 1s windows, vel σ ≈ 0.5 m/s
+    // Plus pitch uncertainty: add 10% of the signal
+    const hV = sinPitch;
+    const rBaro = Math.max(0.5, Math.abs(vzMeasured) * 0.1);
+    const SV = this.S[I.V];
+    // hs = H × S = sinPitch × S[V][:]  (scalar QR, same pattern as ZUPT/ZARU)
+    const hs = this.tmpLatHS;
+    for (let j = 0; j < N; j++) hs[j] = hV * SV[j];
+    const innov = vzMeasured - this.x[I.V] * hV;
+    let sInnov = rBaro * rBaro;
+    for (let j = 0; j < N; j++) sInnov += hs[j] * hs[j];
+    // Chi-square gate: reject if innovation is statistically implausible (3σ ≈ chi²₁,0.99 = 11.3)
+    if (innov * innov / sInnov > 11.3) return;
+    // State update
+    for (let i = 0; i < N; i++) {
+      let p = 0;
+      const lim = Math.min(i, I.V);
+      for (let k = 0; k <= lim; k++) p += this.S[i][k] * hs[k];
+      this.x[i] += p / sInnov * innov;
+    }
+    this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
+    // QR covariance update (scalar QR)
+    const qr = this.tmpLatPre;
+    for (let i = 0; i < MAG_PRE; i++) for (let j = 0; j < N; j++) qr[i][j] = 0;
+    qr[0][0] = rBaro;
+    for (let j = 0; j < N; j++) qr[1][j] = hs[j];
+    for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) qr[i + 1][j] = this.S[i][j];
+    this.qrInPlace(qr, MAG_PRE, MAG_PRE, this.tmpHouseV);
+    for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) this.S[i][j] = qr[i + 1][j];
+    ensureDiag(this.S);
+    let tr = 0;
+    for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) { const v = this.S[i][j]; tr += v * v; }
+    this._traceCache = tr;
   }
 
   updateMag(bearing: number, timestampMs: number): void {
@@ -946,6 +1118,7 @@ export class SrEkf {
     this.S[I.G_BIAS_Z][I.G_BIAS_Z] = biasGBSigma;
     this.S[I.MAG_DECL][I.MAG_DECL] = declSigma;
     this.coasting = false;
+    this.coastSpeedReady = false;
     this.bufTail = 0;
     this.bufLen = 0;
     this.imuTS.clear();
@@ -1198,7 +1371,7 @@ if (absOmega > EPS) {
     return innovVSq / (pvv + rVel * rVel) <= 9.0;
   }
 
-  private computeAdaptiveQ(dt: number, a: number): void {
+  private computeAdaptiveQ(dt: number, a: number, omega: number): void {
     const sqrtDt = Math.sqrt(dt);
     const speedScale = Math.min(Math.sqrt(Math.max(Math.abs(this.x[I.V]), 0.05) / 5), 2);
     for (let i = 0; i < N; i++) this.tmpSqrtQ[i].fill(0);
@@ -1240,7 +1413,8 @@ if (absOmega > EPS) {
     // variance and must NOT count as motion
     this.varAccelEnergy = 0.9 * this.varAccelEnergy + 0.1 * Math.min(sqrtAccelVar, 5);
 
-    const rawGyro = Math.sqrt(Math.max(varGz, 0)) / 0.5;
+    const absOmega = Math.abs(omega);
+    const rawGyro = Math.max(Math.sqrt(Math.max(varGz, 0)), absOmega * 0.1) / 0.5;
     this.gyroEnergy = 0.9 * this.gyroEnergy + 0.1 * Math.min(rawGyro, 5);
     this.varGyroEnergy = 0.9 * this.varGyroEnergy + 0.1 * Math.min(rawGyro, 5);
 
@@ -1264,8 +1438,8 @@ if (absOmega > EPS) {
     // GPS-driven correction. Prevents heading from "getting stuck" during transients.
     const angAccelBoost = Math.min(this.angAccel / 2.0, 1);  // 0→1 for 0→2 rad/s²
     this.tmpSqrtQ[I.V][I.V] = pn.velocity! * sqrtDt * speedScale * (1 + sc.velocityAccel! * this.accelEnergy + sc.velocityStep! * stepEnergy);
-    this.tmpSqrtQ[I.PSI][I.PSI] = pn.heading! * sqrtDt * (1 + sc.headingGyro! * this.gyroEnergy + sc.headingStep! * stepEnergy + 0.3 * this.accelEnergy + 1.5 * angAccelBoost);
-    this.tmpSqrtQ[I.BETA][I.BETA] = pn.sideslip! * sqrtDt * (1 + sc.sideslipGyro! * this.gyroEnergy + sc.sideslipStep! * stepEnergy + 2.0 * angAccelBoost);
+    this.tmpSqrtQ[I.PSI][I.PSI] = pn.heading! * sqrtDt * (1 + sc.headingGyro! * this.gyroEnergy + sc.headingStep! * stepEnergy + 0.3 * this.accelEnergy + 1.5 * angAccelBoost + 0.3 * absOmega);
+    this.tmpSqrtQ[I.BETA][I.BETA] = pn.sideslip! * sqrtDt * (1 + sc.sideslipGyro! * this.gyroEnergy + sc.sideslipStep! * stepEnergy + 2.0 * angAccelBoost + 0.5 * absOmega);
     this.tmpSqrtQ[I.A_BIAS_X][I.A_BIAS_X] = pn.accelBias! * sqrtDt;
     this.tmpSqrtQ[I.G_BIAS_Z][I.G_BIAS_Z] = pn.gyroBias! * sqrtDt * (1 + 0.3 * this.gyroEnergy + 0.5 * angAccelBoost);
     this.tmpSqrtQ[I.MAG_DECL][I.MAG_DECL] = (pn.magDeclination ?? 1e-4) * sqrtDt;
@@ -1293,39 +1467,39 @@ if (absOmega > EPS) {
     this.tmpH[1][I.Y] = 1;
     this.tmpH[2][I.V] = cp;   this.tmpH[2][I.PSI] = -v * sp;  this.tmpH[2][I.BETA] = -v * sp;
     this.tmpH[3][I.V] = sp;   this.tmpH[3][I.PSI] = v * cp;   this.tmpH[3][I.BETA] = v * cp;
-      // At low speed, GPS velocity direction is unreliable (multipath, buildings,
-      // slow city driving). Ramp starts at v=0.5 m/s (down from 1.0 to catch city driving
-      // speeds) and reaches full at v=4.0 m/s (~14 km/h). A gyroEnergy boost temporarily
-      // raises effective speed after a turn so heading corrects faster when it matters most.
-      // During initialization (first 30s), if heading uncertainty is high (psiStd > 0.4),
-      // boost headingGain adaptively to speed up convergence.
-      // NOTE: the GPS-velocity heading gain MUST remain non-trivial at low speed
-      // (e.g. v=1 m/s) — it is the signal that lets magnetic-declination calibrate
-      // (the mag-vs-GPS-velocity heading disagreement is absorbed into magDeclination).
-      // Zeroing it below ~1.5 m/s would make magDeclination unobservable at rest, a
-      // documented feature. In practice low-speed GPS-velocity heading jitter is already
-      // negligible when a magnetometer is present (the mag owns heading there), and the
-      // per-component velRobustW + stationary decouple further suppress noisy Doppler.
-      let headingGain = v < 0.5 ? 0 : Math.min((v - 0.5 + this.gyroEnergy * 0.5) / 3.5, 1);
-     
-     // Adaptive initialization boost: during first 30s after GPS init, if heading
-     // variance is high, temporarily boost GPS correction to accelerate convergence.
-     if (this.gpsInitTimeMs > 0 && this.gpsInitialized) {
-       const timeSinceGpsInit = Math.max(0, this.lastImuTimeMs - this.gpsInitTimeMs);
-       if (timeSinceGpsInit < 30000) {  // First 30 seconds
-         let psiVarGate = 0;
-         for (let k = 0; k <= I.PSI; k++) psiVarGate += this.S[I.PSI][k] * this.S[I.PSI][k];
-         const psiStd = Math.sqrt(psiVarGate);
-         // Boost gain by up to 2× when psiStd is high (uncertain heading)
-         const initBoost = Math.max(0, (psiStd - 0.3) / 0.7);  // Ramps from 0 at 0.3 to 1 at 1.0
-         headingGain = Math.min(headingGain * (1 + 2 * initBoost), 1);
-       }
-     }
-     
-     if (headingGain < 1) {
-       this.tmpH[2][I.PSI] *= headingGain; this.tmpH[2][I.BETA] *= headingGain;
-       this.tmpH[3][I.PSI] *= headingGain; this.tmpH[3][I.BETA] *= headingGain;
-     }
+    // At low speed, GPS velocity direction is unreliable (multipath, buildings,
+    // slow city driving). Ramp starts at v=0.5 m/s (down from 1.0 to catch city driving
+    // speeds) and reaches full at v=4.0 m/s (~14 km/h). A gyroEnergy boost temporarily
+    // raises effective speed after a turn so heading corrects faster when it matters most.
+    // During initialization (first 30s), if heading uncertainty is high (psiStd > 0.4),
+    // boost headingGain adaptively to speed up convergence.
+    // NOTE: the GPS-velocity heading gain MUST remain non-trivial at low speed
+    // (e.g. v=1 m/s) — it is the signal that lets magnetic-declination calibrate
+    // (the mag-vs-GPS-velocity heading disagreement is absorbed into magDeclination).
+    // Zeroing it below ~1.5 m/s would make magDeclination unobservable at rest, a
+    // documented feature. In practice low-speed GPS-velocity heading jitter is already
+    // negligible when a magnetometer is present (the mag owns heading there), and the
+    // per-component velRobustW + stationary decouple further suppress noisy Doppler.
+    let headingGain = v < 0.5 ? 0 : Math.min((v - 0.5 + this.gyroEnergy * 0.5) / 3.5, 1);
+
+    // Adaptive initialization boost: during first 30s after GPS init, if heading
+    // variance is high, temporarily boost GPS correction to accelerate convergence.
+    if (this.gpsInitTimeMs > 0 && this.gpsInitialized) {
+      const timeSinceGpsInit = Math.max(0, this.lastImuTimeMs - this.gpsInitTimeMs);
+      if (timeSinceGpsInit < 30000) {  // First 30 seconds
+        let psiVarGate = 0;
+        for (let k = 0; k <= I.PSI; k++) psiVarGate += this.S[I.PSI][k] * this.S[I.PSI][k];
+        const psiStd = Math.sqrt(psiVarGate);
+        // Boost gain by up to 2× when psiStd is high (uncertain heading)
+        const initBoost = Math.max(0, (psiStd - 0.3) / 0.7);  // Ramps from 0 at 0.3 to 1 at 1.0
+        headingGain = Math.min(headingGain * (1 + 2 * initBoost), 1);
+      }
+    }
+
+    if (headingGain < 1) {
+      this.tmpH[2][I.PSI] *= headingGain; this.tmpH[2][I.BETA] *= headingGain;
+      this.tmpH[3][I.PSI] *= headingGain; this.tmpH[3][I.BETA] *= headingGain;
+    }
   }
 
   private computeGpsInnovation(z: Float64Array): void {
@@ -1809,11 +1983,11 @@ if (absOmega > EPS) {
       let ph = 0;
       for (let k = 0; k <= i; k++) ph += this.S[i][k] * hs[k];
       this.x[i] += ph / Si * innov;
-      }
-      this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
+    }
+    this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
 
-      // QR covariance update (scalar QR, same pattern as mag)
-      const A = this.tmpLatPre;
+    // QR covariance update (scalar QR, same pattern as mag)
+    const A = this.tmpLatPre;
     for (let i = 0; i < MAG_PRE; i++) A[i].fill(0);
 
     A[0][0] = r;

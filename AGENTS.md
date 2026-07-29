@@ -29,6 +29,7 @@ Removed `a_bias_y` — unobservable from forward acceleration alone; removing im
 | Low (1–10 Hz) | GPS (x, y, vx, vy, accuracy) | Update — Mahalanobis-gated correction |
 | Medium (10–100 Hz) | Magnetometer (bearing) | Update — heading observation + declination auto-calibration |
 | On change | Device orientation (azimuth, pitch, roll) | Frame alignment — rotates IMU from device to ENU |
+| On change | Barometer (altitude) | Coasting ramp speed — constrains v via vz = v × sin(pitch) on grade |
 
 IMU readings are used as **control inputs** with on-line bias compensation:
 - ω = gz − `g_bias_z` (turn rate)
@@ -62,7 +63,7 @@ else:
   y' = y + v̅·sin(α)·dt
 
 v'  = v + a_forward·dt
-ψ'  = ψ + ω·dt·omegaScale, where omegaScale = (v==0) ? 1 : max(min(|v|/0.5, 1), stillness)
+ψ'  = ψ + ω̅·dt·omegaScale, where ω̅ = ½(ω_prev + ω_curr)
 β'  = β · exp(−dt/τ)   (mean-reversion toward 0)
 τ = base × (1 − 0.6 × angAccelNorm), where base = |v| < 0.3 ? 0.1 : (|ω| > ε ? 1.5 : max(0.5, 1.5 − (|v|−1.5) / 3.5)), angAccelNorm = min(|dω/dt| / 3.0, 1)
 a_bias_x' = a_bias_x · exp(−dt/50)   (mean-reversion when accelEnergy < 0.05)
@@ -70,9 +71,10 @@ g_bias_z' = g_bias_z   (random walk, corrected by ZARU during stationary)
 magDeclination' = magDeclination   (random walk)
 ```
 
-- **v̅ = v + ½·a·dt**: Uses the average velocity over the timestep (instead of start-of-step v) in the CTRA position deltas. For straight-line motion this makes the position integration exact for constant acceleration. Jacobian entries for position derivatives (`∂x/∂ψ`, `∂x/∂β`, `∂x/∂g_bias_z`, and y-sym) also use `v̅` to match the forward model; `∂x/∂a_bias_x = -½·dt·∂x/∂v` and `∂y/∂a_bias_x = -½·dt·∂y/∂v` remain correct because `∂x/∂v = ∂x/∂v̅`.
+- **v̅ = v + ½·a·dt**: Uses the average velocity over the timestep (instead of start-of-step v) in the CTRA position deltas. For straight-line motion this makes the position integration exact for constant acceleration. Jacobian entries for position derivatives (`∂x/∂ψ`, `∂x/∂β`, `∂x/∂g_bias_z`, and y-sym) also use `v̅` and `ω̅` to match the forward model; `∂x/∂a_bias_x = -½·dt·∂x/∂v` and `∂y/∂a_bias_x = -½·dt·∂y/∂v` remain correct because `∂x/∂v = ∂x/∂v̅`.
  - **v is no longer hard-clamped to ≥ 0 in `predict`**: Removed `Math.max(0, v)` from predict, lateral accel/ZUPT scalar QR, and ZARU so the filter can express genuine reverse motion. However, the GPS update maintains the invariant **v ≥ 0** with **ψ = direction of motion**: (1) the 180° flip-recovery fires on anti-parallel GPS velocity whenever `v > 0.8` (no position-χ² gate needed), flipping ψ by π before v can go negative; and (2) a post-update backstop reparameterizes any residual `v < 0` into the equivalent `(−v, ψ+π, β+π)` branch (velocity vector unchanged), with the V row/column of the Cholesky factor sign-flipped. This eliminates the reported "U-turn → negative velocity / heading snaps to nose" symptom. All speed-dependent calculations consistently use `Math.abs(v)`: `speedScale`, `maxPlausibleSpeed`, β time constant `|v|<0.3`, lateral accel gate `|v|>0.2`, outlier guard, `speedRamp`, `velFactor`, etc.
 - **a_bias_x mean-reversion**: When `accelEnergy < 0.05` (near-zero dynamic acceleration), the bias drifts toward zero with a 50s time constant. This prevents unbounded bias drift during extended constant-speed travel, which would otherwise cause velocity overshoot during GPS outages. Jacobian `F[A_BIAS_X][A_BIAS_X] = exp(−dt/50)` mirrors the state decay.
+- **Trapezoidal Heading Integration**: Heading ψ is integrated using the average turn rate `ω̅ = ½(ω_prev + ω_curr)` over the interval `dt`. This reduces heading lag and overshoot during angular transients (corner entry/exit) compared to forward-Euler integration. Position integration via `ctraDelta` also uses `ω̅` for consistency.
 
 ### GPS Measurement Model
 
@@ -150,16 +152,16 @@ All position derivatives (`∂x/∂ψ`, `∂x/∂β`, `∂x/∂g_bias_z`, and y-
 EMA-tracked IMU energy metrics dynamically scale process noise:
 - `accelEnergy` — 0.9 EMA of `max(sqrt(max(varAx+varAy, 0)) / 5, |a_forward| / 5)`, clamped to [0, 5]  
   The `|a_forward|/5` term catches constant braking/deceleration where variance is zero but sustained acceleration is present
-- `gyroEnergy` — 0.9 EMA of `sqrt(max(varGz, 0)) / 0.5`, clamped to [0, 5]
+- `gyroEnergy` — 0.9 EMA of `max(sqrt(max(varGz, 0)), |ω| × 0.1) / 0.5`, clamped to [0, 5] (turn rate magnitude prevents Q-starvation during steady turns)
 - `stepEnergy` — `min(stepFreq / 3.0, 1.0)` from step detection
 
 Scales applied multiplicatively to process noise diagonals:
 - Position: `1 + positionAccel × accelEnergy`
 - Velocity: `1 + velocityAccel × accelEnergy + velocityStep × stepEnergy`
-- Heading: `1 + headingGyro × gyroEnergy + headingStep × stepEnergy + 0.3 × accelEnergy + 1.5 × angAccelBoost` (accelEnergy captures body sway; angAccelBoost inflates Q during corner entry/exit transients)
-- Sideslip: `1 + sideslipGyro × gyroEnergy + sideslipStep × stepEnergy + 2.0 × angAccelBoost`
+- Heading: `1 + headingGyro × gyroEnergy + headingStep × stepEnergy + 0.3 × accelEnergy + 1.5 × angAccelBoost + 0.3 × |ω|`
+- Sideslip: `1 + sideslipGyro × gyroEnergy + sideslipStep × stepEnergy + 2.0 × angAccelBoost + 0.5 × |ω|`
 - AccelBias: no scaling (pure random walk)
-- GyroBias: `× (1 + 0.3 × gyroEnergy + 0.5 × angAccelBoost)` (gyro energy increases yaw-rate uncertainty; angAccelBoost allows faster bias correction during transients)
+- GyroBias: `× (1 + 0.3 × gyroEnergy + 0.5 × angAccelBoost)`
 
 Where `angAccelBoost = min(|dω/dt| / 2.0, 1)` — ramps 0→1 for angular acceleration 0→2 rad/s². Zero on straights, full during corner entry/exit.
 
@@ -236,8 +238,8 @@ Two defenses prevent position/heading jumps from noisy GPS in low-speed city env
 5. **Rest-weighted velocity H blocking**: When IMU energy is near zero (`accelEnergy + gyroEnergy < 0.05`), the GPS velocity heading columns (`H[2:3][PSI/BETA]`) are smoothly reduced by a speed-dependent factor `(1 − restW)` where `restW = clamp((1.5 − |v|) / 1.0, 0, 1)`. At rest this completely blocks GPS velocity from rotating ψ, handing authority to the magnetometer. At speed the blocking fades, allowing GPS velocity direction to own heading.
 
 ### Lateral Acceleration Constraint
-- During turns (`|ω| > 0.1`, `|v| > 0.2`, no device-to-ENU orientation), uses `ay ≈ v·ω` as a pseudo-measurement to estimate sideslip from centripetal acceleration mismatch — higher omega gate prevents body sway (0.3–0.8 m/s²) from corrupting heading during straight-line walking
-- Enabled by default (`useLateralAccel: true`) — safe to enable because it's gated on `deviceToEnu === null` (IMU in vehicle frame)
+- During turns (`|ω| > 0.1`, `|v| > 0.2`), uses `ay ≈ v·ω` as a pseudo-measurement to estimate sideslip from centripetal acceleration mismatch — higher omega gate prevents body sway (0.3–0.8 m/s²) from corrupting heading during straight-line walking. `ay` is projected into the vehicle body frame before this check (forward/lateral decomposition), so the constraint works correctly regardless of whether device orientation alignment is active
+- Enabled by default (`useLateralAccel: true`)
 - Measurement noise `r = 1.0 m/s²`
 
 ### Robust M-Estimation (Cauchy/Huber)
@@ -273,7 +275,10 @@ When GPS is lost (tunnel, parking garage, urban canyon), the filter transitions 
 - **Magnetometer** provides heading corrections at low speed (`|v| < 1.5` m/s) when stopped in a tunnel — `updateMag()` is independent of GPS
 - **Coasting Q reduction**: During coasting, position/velocity process noise is scaled to 30% (`COAST_Q_FACTOR = 0.3`) — without GPS corrections, bias-driven position error is already captured in P via cross-covariance; adding full Q over-inflates uncertainty. Heading/bias Q remain at full strength since ZARU/Mag still provide corrections
 - **Coast covariance cap**: Position σ capped at 500m, velocity σ at 50 m/s during coasting — prevents unbounded growth in very long tunnels (2+ minutes)
-- **Stale GPS speed decay**: After 10s of coasting, `lastGpsSpeed` decays toward 0 with 5s time constant — enables ZUPT to engage if the car stops in a tunnel (previously blocked permanently when GPS was lost at >2 m/s)
+- **Stale GPS speed decay**: `lastGpsSpeed` decays immediately (no delay) toward 0 with 2s time constant during coasting — enables ZUPT to engage within ~2 seconds if the car stops in a basement/tunnel (previously blocked for ~25s after highway-speed GPS loss)
+- **Velocity damping during coasting**: When GPS is lost for >3s and the car appears stationary (`accelEnergy + gyroEnergy < 0.1`), a scalar QR pseudo-measurement injects `v ≈ 0` with measurement noise that tightens over time (`R = max(0.05, 10/coastTimeS)`) — prevents the "car icon shoots forward" symptom where uncorrected accel bias integrates into persistent forward velocity. Genuine motion is preserved because the pseudo-measurement only fires when IMU energy is near zero
+- **Velocity prior during coasting**: When GPS is lost and the car is moving (not stopped), a soft scalar QR pseudo-measurement pulls `v` toward `coastSpeed` (the speed captured at GPS loss). Measurement noise grows linearly with coast time (`R = 2 + coastTimeS × 0.6`, capped at 20) — tight anchor at onset (strong velocity constraint), loose after ~30s (car may have turned/stopped). Prevents accel bias from drifting velocity during continuous-motion multi-basement driving where the car never stops long enough for ZUPT to engage. Only fires when IMU energy > 0.05 or |v| > 0.5 m/s (excludes stationary). `coastSpeed` is captured once when coasting begins and reset when GPS re-acquires
+- **Barometric speed estimation** (`updateBaro(altitude, timestampMs)`): Uses the phone barometer to constrain forward speed on ramps via `vz = v × sin(pitch)`. When |sin(pitch)| > 0.03 (≥ 1.7° grade, typical parking ramps) and coasting, a scalar QR pseudo-measurement injects `v = vz_measured / sin(pitch)` with noise `max(0.5, |vz| × 0.1)` reflecting barometer accuracy + pitch uncertainty. Chi-square gate (threshold 11.3 = 3σ) rejects implausible innovations. Requires device orientation to be set (`deviceToEnu !== null`) for pitch estimate. On flat ground (|sin(pitch)| ≤ 0.03) the update is skipped — no speed information from barometer. Addresses ramp driving where continuous altitude change provides an independent speed observable not available from IMU alone
 
 ## Configuration
 
@@ -344,6 +349,8 @@ class SrEkf {
 
   updateMag(bearing: number, timestampMs: number): void
 
+  updateBaro(altitude: number, timestampMs: number): void
+
   setOrientation(azimuth: number, pitch: number, roll: number): void
 
   coast(timeoutMs: number, currentTimeMs: number): boolean
@@ -397,6 +404,6 @@ Designed for 50–400 Hz IMU and 1–10 Hz GPS on resource-constrained devices:
 ## Validation
 
 ```bash
-npm test                 # 70 tests (9 QR verification + 61 unit)
+npm test                 # 72 tests (9 QR verification + 63 unit)
 npm run test:watch       # watch mode
 ```

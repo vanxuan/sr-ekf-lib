@@ -510,6 +510,29 @@ describe('SrEkf', () => {
     expect(s1.psi).toBeCloseTo(s2.psi, 10)
   })
 
+  it('should fire lateral accel constraint with device orientation set', () => {
+    // With the fix, lateral accel fires regardless of deviceToEnu because ay
+    // is already projected into the vehicle body frame in predict().  Verify
+    // that a turning car with orientation set has velocity constrained by the
+    // lateral accel constraint (v ≈ ay/omega).
+    const ekf = new SrEkf({
+      processNoise: { position: 0, velocity: 0, heading: 0, accelBias: 0, gyroBias: 0, sideslip: 0 },
+      useLateralAccel: true
+    })
+    ekf.reset(0, 0, 5, 0)
+    ekf.setOrientation(0, 0, 0)
+    // Turn: gz=0.5 rad/s, ay=2.5 (centripetal = v*ω = 5*0.5 = 2.5)
+    for (let i = 0; i < 50; i++) ekf.predict(0, 2.5, 0.5, 0.02, i, 0, 0, 0)
+    const s = ekf.getState()
+    // Lateral accel constrains v during turns — velocity should remain near 5 m/s
+    // (without lateral accel, accumulated heading error from the turn could drift v)
+    expect(s.v).toBeGreaterThan(4.5)
+    expect(s.v).toBeLessThan(5.5)
+    // Heading should accumulate from the turn: ψ ≈ ω*dt*N = 0.5*0.02*50 = 0.5 rad
+    expect(s.psi).toBeGreaterThan(0.4)
+    expect(s.psi).toBeLessThan(0.6)
+  })
+
   it('should separate sideslip from heading using mag + GPS', () => {
     const ekf = new SrEkf({
       measurementNoise: { position: 10.0, velocity: 0.3, heading: 0.05 },
@@ -1215,5 +1238,44 @@ describe('SrEkf', () => {
     const after = ekf.getState()
     expect(ekf.getDiagnostics().stationary).toBe(false)
     expect(after.v).toBeGreaterThan(0.1)
+  })
+
+  it('should track heading during corner entry and exit with minimal lag (Trapezoidal integration)', () => {
+    const ekf = new SrEkf({
+      processNoise: { position: 1.0, velocity: 0.1, heading: 0.05, sideslip: 0.05, accelBias: 1e-5, gyroBias: 1e-6 },
+      measurementNoise: { position: 1.0, velocity: 0.2 }
+    })
+    ekf.reset(0, 0, 10, 0)
+    const dt = 0.02, truthDt = 0.001, v = 10
+    let time = 0, truePsi = 0, trueX = 0, trueY = 0
+    let maxHeadingError = 0
+    const getOmegaAt = (t: number) => {
+      if (t < 5) return 0
+      if (t < 6) return (t - 5)
+      if (t < 8) return 1
+      if (t < 9) return 1 - (t - 8)
+      return 0
+    }
+    let nextGpsTime = 0
+    while (time < 10) {
+      for (let j = 0; j < dt / truthDt; j++) {
+        const t = time + j * truthDt
+        const w = getOmegaAt(t)
+        truePsi += w * truthDt
+        trueX += v * Math.cos(truePsi) * truthDt
+        trueY += v * Math.sin(truePsi) * truthDt
+      }
+      time += dt
+      const wEKF = getOmegaAt(time)
+      ekf.predict(0, v * wEKF, wEKF, dt, time * 1000)
+      if (time >= nextGpsTime) {
+        ekf.updateGps(trueX, trueY, v * Math.cos(truePsi), v * Math.sin(truePsi), time * 1000)
+        nextGpsTime += 1.0
+      }
+      const s = ekf.getState()
+      const error = Math.abs((s.psi - truePsi + 3 * Math.PI) % (2 * Math.PI) - Math.PI)
+      maxHeadingError = Math.max(maxHeadingError, error)
+    }
+    expect(maxHeadingError * 180 / Math.PI).toBeLessThan(5.0)
   })
 })
