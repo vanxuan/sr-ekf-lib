@@ -542,14 +542,16 @@ describe('SrEkf', () => {
     const omega = 0.3
     const trueBeta = 0.08
     for (let i = 0; i < 200; i++) {
-      const t = i * 0.1
-      ekf.predict(0, 0, omega, 0.1, i)
+      const dt = 0.1
+      const t = i * dt
+      const timestampMs = i * 100
+      ekf.predict(0, 0, omega, dt, timestampMs)
       const psi_t = omega * t
       const alpha = psi_t + trueBeta
       const x = (10 / omega) * (Math.sin(omega * t + trueBeta) - Math.sin(trueBeta))
       const y = (10 / omega) * (-Math.cos(omega * t + trueBeta) + Math.cos(trueBeta))
-      ekf.updateMag(psi_t, i)
-      ekf.updateGps(x, y, 10 * Math.cos(alpha), 10 * Math.sin(alpha), i, 15)
+      ekf.updateMag(psi_t, timestampMs)
+      ekf.updateGps(x, y, 10 * Math.cos(alpha), 10 * Math.sin(alpha), timestampMs, 15)
     }
     const s = ekf.getState()
     expect(s.beta).toBeGreaterThan(0.03)
@@ -1300,5 +1302,28 @@ describe('SrEkf', () => {
     const s = ekf.getState()
     expect(s.v).toBeCloseTo(trueV, 0.2)
     expect(Math.abs((s.psi - truePsi + 3 * Math.PI) % (2 * Math.PI) - Math.PI)).toBeLessThan(0.1)
+  })
+
+  it('should snap to GPS position when exiting basement at low speed', () => {
+    const ekf = new SrEkf({
+      measurementNoise: { position: 3.0, velocity: 0.5 }
+    })
+    ekf.updateGps(0, 0, 0, 0, 1000)
+    let t = 1000
+    for (let i = 0; i < 20; i++) {
+      t += 100
+      ekf.predict(0, 0, 0, 0.1, t)
+      if (i % 10 === 0) ekf.updateGps(0, 0, 0, 0, t)
+    }
+    for (let i = 0; i < 150; i++) {
+      t += 100
+      ekf.predict(0.1, 0, 0, 0.1, t)
+    }
+    ekf.coast(5000, t)
+    const stateBefore = ekf.getState()
+    const jumpX = stateBefore.x + 30
+    ekf.updateGps(jumpX, 0, 1.5, 0, t + 100)
+    const stateAfter = ekf.getState()
+    expect(stateAfter.x - stateBefore.x).toBeGreaterThan(25)
   })
 })

@@ -677,13 +677,13 @@ export class SrEkf {
       }
     }
 
-    // Auto-detect divergence: if the last GPS update was rejected AND the
-    // GPS position is >10m from the current state, the state has clearly
-    // diverged (e.g. after basement exit). Force coasting so resetFromGps
-    // triggers, even if a brief glitchy GPS kept lastGpsTimeMs alive.
-    if (!this.coasting && !this.lastGatePassed) {
+    // Auto-detect divergence: if the last GPS update was rejected (or heavily
+    // down-weighted by Huber) AND the GPS position is >100m from the current
+    // state, the state has clearly diverged (e.g. after basement exit). Force
+    // coasting so resetFromGps triggers on the next fix.
+    if (!this.coasting && (!this.lastGatePassed || this.robustWeight < 0.05)) {
       const dxDiv = x - this.x[I.X], dyDiv = y - this.x[I.Y];
-      if (dxDiv * dxDiv + dyDiv * dyDiv > 100) {
+      if (dxDiv * dxDiv + dyDiv * dyDiv > 10000) {
         this.coasting = true;
       }
     }
@@ -737,12 +737,10 @@ export class SrEkf {
     // jump is physically plausible (at highway speeds ~50 m/s + 2m GPS
     // noise), the chiSq would pass with inflated R but the Kalman gain
     // drops to ~0.04, producing minute-long convergence. Force reset.
-    // Only trigger when genuinely moving (v > 2 m/s): at stationary, GPS
-    // position noise routinely exceeds the 6m/1.5m guard thresholds and
-    // resetFromGps would corrupt heading by setting psi = atan2(noisy v).
-    if (posR / preGuardPosR > 3 && Math.abs(this.x[I.V]) > 2.0) {
+    // Allow snap at low speeds (>0.5 m/s) or for very large jumps (>15m).
+    if (posR / preGuardPosR > 3) {
       const dxNorm = Math.sqrt(dxGps * dxGps + dyGps * dyGps);
-      if (dxNorm < dtSinceLastGps * 50 + 2) {
+      if (dxNorm < dtSinceLastGps * 50 + 2 && (Math.abs(this.x[I.V]) > 0.5 || dxNorm > 15)) {
         this.resetFromGps(x, y, vx, vy);
         this.lastGpsTimeMs = effectiveGpsTime;
         this.lastGatePassed = true;
@@ -1696,19 +1694,24 @@ if (absOmega > EPS) {
 
     // Separate position/velocity gating: if joint gate fails, position alone
     // still deserves a pass (position has higher trust than GPS velocity).
-    if (!rw.enabled && chiSq > this.config.gateThreshold) {
-      if (chiSqPos <= this.config.gateThreshold) {
-        // Position sub-gate passes → accept despite noisy velocity
-        // BUT if coasting after GPS loss, force full reset to fix
-        // heading/velocity that may be corrupted after extended IMU-only prediction
-        if (this.coasting) {
-          this.resetFromGps(this.tmpZ[0], this.tmpZ[1], this.tmpZ[2], this.tmpZ[3]);
-          return true;
+    if (chiSq > this.config.gateThreshold) {
+      if (!rw.enabled || totalWeight < 0.1) {
+        if (chiSqPos <= this.config.gateThreshold) {
+          // Position sub-gate passes → accept despite noisy velocity
+          // BUT if coasting after GPS loss, force full reset to fix
+          // heading/velocity that may be corrupted after extended IMU-only prediction
+          if (this.coasting) {
+            this.resetFromGps(this.tmpZ[0], this.tmpZ[1], this.tmpZ[2], this.tmpZ[3]);
+            return true;
+          }
+        } else {
+          // Both joint and position fail → reject or reset
+          if (this.coasting) {
+            this.resetFromGps(this.tmpZ[0], this.tmpZ[1], this.tmpZ[2], this.tmpZ[3]);
+            return true;
+          }
+          if (!rw.enabled) return false;
         }
-      } else {
-        // Both joint and position fail → reject
-        if (this.coasting) { this.resetFromGps(this.tmpZ[0], this.tmpZ[1], this.tmpZ[2], this.tmpZ[3]); return true; }
-        return false;
       }
     }
 
