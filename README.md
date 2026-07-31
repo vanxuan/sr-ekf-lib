@@ -65,6 +65,9 @@ console.log(nav.x, nav.y, nav.v, nav.psi)  // position, speed, heading
 - **Sideslip state** — separates vehicle heading from velocity direction
 - **Frame alignment** — rotates IMU from device frame to ENU via device orientation
 - **Low-speed jump protection** — 5 defenses against urban GPS multipath
+- **Fast GPS re-acquisition** — snaps to the first valid fix after GPS loss (basement exit, tunnel exit) instead of slowly crawling; divergence auto-detection forces a full reset when the state has clearly drifted
+- **Barometric speed estimation** — `updateBaro()` constrains forward speed on ramps via `vz = v × sin(pitch)` during GPS outages
+- **Robustness in coasting** — GPS fixes are force-accepted (with reset) when coasting, even under Huber down-weighting, so recovery never stalls
 
 ## API
 
@@ -74,10 +77,13 @@ class SrEkf {
   predict(ax, ay, gz, dt, timestampMs, az?, gx?, gy?): void
   updateGps(x, y, vx, vy, timestampMs, accuracyMeters?): boolean
   updateMag(bearing, timestampMs): void
+  updateBaro(altitude, timestampMs): void      // barometric speed on ramps during GPS outage
   setOrientation(azimuth, pitch, roll): void
   coast(timeoutMs, currentTimeMs): boolean
   getState(): NavigationSolution
   getStateInto(out: NavigationSolution): void   // zero-allocation path
+  getImuStats(): { n, meanAxRel, stdAx, meanGzRel, stdGz, lastOmega }
+  getStillness(): number                        // 0 = in motion, 1 = at rest (IMU variance-based)
   getDiagnostics(): EkfDiagnostics
   reset(x, y, v, psi): void
   resetBiases(aBiasX?, gBiasZ?): void
@@ -175,6 +181,8 @@ new SrEkf({
 
 4. **ZUPT** (on IMU): when the device is stationary (variance-based detection), a zero-velocity pseudo-measurement corrects biases through cross-covariance.
 
+5. **GPS re-acquisition** (after loss): when coasting and a GPS fix's innovation is statistically implausible, the filter snaps directly to the fix (`resetFromGps`) — biases learned during coasting are preserved. The outlier guard no longer masks large position jumps: if it inflates measurement noise >3× and the jump is physically plausible, the fix is force-accepted (when moving >0.5 m/s or the jump exceeds 15m) so recovery is immediate instead of minute-long.
+
 ## Mobile Performance
 
 - **Zero allocations** on `predict()` and `getStateInto()` hot paths
@@ -185,7 +193,7 @@ new SrEkf({
 ## Validation
 
 ```bash
-npm test                 # 70 tests (9 QR verification + 61 unit)
+npm test                 # 74 tests (9 QR verification + 65 unit)
 npm run build            # TypeScript → dist/
 ```
 

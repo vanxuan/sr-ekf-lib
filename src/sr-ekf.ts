@@ -1350,7 +1350,7 @@ if (absOmega > EPS) {
     return Math.max(0, sumSq / n - mean * mean);
   }
 
-  private getStillness(): number {
+  getStillness(): number {
     // Exponential stillness: still = exp(-(σ_a²/T_a² + σ_ω²/T_ω²))
     // σ_a² = component-wise acceleration variance (bias-invariant — constant
     // gravity projection has zero variance and doesn't reduce stillness)
