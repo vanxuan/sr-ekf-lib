@@ -1863,12 +1863,18 @@ if (absOmega > EPS) {
     // declination at its last calibrated value; it is a slow random walk).
     if (magHeadingTrust < 0.2) return;
 
+    // Init-snap: bootstrap heading from the compass ONLY while heading is still
+    // genuinely unlearned (pre-GPS-init, heading covariance at its initial value).
+    // Previously the snap also fired when mag-declination covariance was still at
+    // its initial value — which is true right after ANY GPS init (GPS init resets
+    // S[MAG_DECL] to its initial covariance). That let the first low-speed compass
+    // reading override a GPS-learned heading with the raw bearing, veering the car
+    // icon off the road. Declination is calibrated via the normal cross-covariance
+    // update below, not by re-snapping an already-learned ψ.
     const initCovHeading = this.config.initialCovariance.heading!;
-    const initCovMagDecl = this.config.initialCovariance.magDeclination ?? 0.25;
     const psiCov = this.S[I.PSI][I.PSI] * this.S[I.PSI][I.PSI];
-    const magDeclCov = this.S[I.MAG_DECL][I.MAG_DECL] * this.S[I.MAG_DECL][I.MAG_DECL];
     const psiMag = this.wrapAngle(bearing + this.x[I.MAG_DECL]);
-    if (psiCov > initCovHeading * 0.99 || magDeclCov > initCovMagDecl * 0.99)
+    if (psiCov > initCovHeading * 0.99)
       this.x[I.PSI] = psiMag;
 
     // GPS owns heading → skip the mag correction (keeps declination at its last

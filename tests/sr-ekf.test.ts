@@ -464,6 +464,26 @@ describe('SrEkf', () => {
     expect(s.psi).toBeCloseTo(1.5, 5)
   })
 
+  it('should not re-snap GPS-learned heading to a misaligned compass after GPS init', () => {
+    // Regression: the mag init-snap also fired when mag-declination covariance was
+    // still at its initial value (which is true right after any GPS init, since GPS
+    // init resets S[MAG_DECL]). The first low-speed compass reading then overrode
+    // the correct GPS-learned heading, veering the car off the road at startup.
+    const ekf = new SrEkf({ measurementNoise: { position: 3.0, velocity: 0.5 } })
+    ekf.reset(0, 0, 0, 0)
+    // GPS init while moving east → heading learned to 0, declination cov still 0.25
+    ekf.updateGps(0, 0, 5, 0, 0)
+    expect(ekf.getState().psi).toBeCloseTo(0, 5)
+    // Low-speed misaligned compass (60°) — must NOT snap psi away from the road
+    ekf.predict(1, 0, 0, 0.1, 1)
+    ekf.updateMag(Math.PI / 3, 100)
+    expect(Math.abs(ekf.getState().psi)).toBeLessThan(0.1)
+    // Heading must stay put while continuing at low speed
+    for (let i = 2; i <= 20; i++) ekf.predict(0, 0, 0, 0.1, i)
+    ekf.updateMag(Math.PI / 3, 200)
+    expect(Math.abs(ekf.getState().psi)).toBeLessThan(0.1)
+  })
+
   it('should rotate IMU readings with non-identity orientation', () => {
     const ekf = new SrEkf({
       processNoise: { position: 0, velocity: 0, heading: 0, accelBias: 0, gyroBias: 0 }
