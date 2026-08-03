@@ -171,6 +171,7 @@ export class SrEkf {
   private lastOmega = 0;             // bias-corrected gyro rate (rad/s) from the last predict()
   private prevOmega = 0;             // omega from the previous predict() for angular acceleration
   private angAccel = 0;              // |dω/dt| (rad/s²) — angular acceleration magnitude
+  private smoothAngAccel = 0;        // EMA of angAccel to sustain boost after transients
   private lastPredictTimeMs = 0;
   private prevCallMagBearing = 0;     // compass bearing at the previous updateMag() call
   private prevCallMagTimeMs = 0;     // timestamp at the previous updateMag() call
@@ -265,6 +266,7 @@ export class SrEkf {
     this.lastOmega = 0;
     this.prevOmega = 0;
     this.angAccel = 0;
+    this.smoothAngAccel = 0;
     this.lastPredictTimeMs = 0;
     this.prevCallMagBearing = 0;
     this.prevCallMagTimeMs = 0;
@@ -419,10 +421,15 @@ export class SrEkf {
     const absV = Math.abs(v), absOmega = Math.abs(omega);
 
     // Angular acceleration: |dω/dt| for transient detection (corner entry/exit)
-    if (this.lastPredictTimeMs > 0)
+    if (this.lastPredictTimeMs > 0) {
       this.angAccel = Math.min(Math.abs(omega - oldOmega) / Math.max(dt, 1e-6), 10);
-    else
+      // Sustain angAccel boost for ~0.5s after the transient ends
+      const sustainAlpha = Math.exp(-dt / 0.5);
+      this.smoothAngAccel = Math.max(this.angAccel, this.smoothAngAccel * sustainAlpha);
+    } else {
       this.angAccel = 0;
+      this.smoothAngAccel = 0;
+    }
 
     const omegaAvg = (this.lastPredictTimeMs > 0) ? 0.5 * (oldOmega + omega) : omega;
     this.prevOmega = omega;
@@ -438,7 +445,7 @@ export class SrEkf {
     // Sideslip time constant: shorter during angular transients (corner entry/exit)
     // so β tracks the rapidly changing slip angle instead of lagging and corrupting ψ.
     // At max angAccel (3 rad/s²), τ drops to 40% of its base value.
-    const angAccelNorm = Math.min(this.angAccel / 3.0, 1);
+    const angAccelNorm = Math.min(this.smoothAngAccel / 3.0, 1);
     const betaTauBase = absV < 0.3 ? 0.1
       : absOmega > EPS ? 1.5
       : Math.max(0.5, 1.5 - (absV - 1.5) * (1.0 / 3.5));
@@ -1214,6 +1221,8 @@ export class SrEkf {
     this.gyroEnergy = 0;
     this.varAccelEnergy = 0;
     this.varGyroEnergy = 0;
+    this.angAccel = 0;
+    this.smoothAngAccel = 0;
     this.bufLen = restoreOffset + 1;
     // bufTail unchanged — prior history preserved for re-rewind
     return futureCount;
@@ -1436,7 +1445,8 @@ if (absOmega > EPS) {
     // Angular acceleration Q boost: during corner entry/exit (high |dω/dt|), inflate
     // heading/sideslip/gyroBias Q so the filter trusts its state less and allows faster
     // GPS-driven correction. Prevents heading from "getting stuck" during transients.
-    const angAccelBoost = Math.min(this.angAccel / 2.0, 1);  // 0→1 for 0→2 rad/s²
+    // Uses smoothAngAccel to sustain the boost for ~0.5s after the rotation stops.
+    const angAccelBoost = Math.min(this.smoothAngAccel / 2.0, 1);  // 0→1 for 0→2 rad/s²
     this.tmpSqrtQ[I.V][I.V] = pn.velocity! * sqrtDt * speedScale * (1 + sc.velocityAccel! * this.accelEnergy + sc.velocityStep! * stepEnergy);
     this.tmpSqrtQ[I.PSI][I.PSI] = pn.heading! * sqrtDt * (1 + sc.headingGyro! * this.gyroEnergy + sc.headingStep! * stepEnergy + 0.3 * this.accelEnergy + 1.5 * angAccelBoost + 0.3 * absOmega);
     this.tmpSqrtQ[I.BETA][I.BETA] = pn.sideslip! * sqrtDt * (1 + sc.sideslipGyro! * this.gyroEnergy + sc.sideslipStep! * stepEnergy + 2.0 * angAccelBoost + 0.5 * absOmega);
@@ -1468,19 +1478,14 @@ if (absOmega > EPS) {
     this.tmpH[2][I.V] = cp;   this.tmpH[2][I.PSI] = -v * sp;  this.tmpH[2][I.BETA] = -v * sp;
     this.tmpH[3][I.V] = sp;   this.tmpH[3][I.PSI] = v * cp;   this.tmpH[3][I.BETA] = v * cp;
     // At low speed, GPS velocity direction is unreliable (multipath, buildings,
-    // slow city driving). Ramp starts at v=0.5 m/s (down from 1.0 to catch city driving
-    // speeds) and reaches full at v=4.0 m/s (~14 km/h). A gyroEnergy boost temporarily
-    // raises effective speed after a turn so heading corrects faster when it matters most.
-    // During initialization (first 30s), if heading uncertainty is high (psiStd > 0.4),
-    // boost headingGain adaptively to speed up convergence.
+    // slow city driving). Ramp starts at v=0.2 m/s (down from 0.5 to catch slow
+    // corner exits) and reaches full at v=3.0 m/s (~11 km/h). A smoothAngAccel boost
+    // temporarily raises effective speed after a turn so heading corrects faster when
+    // it matters most (recovering from corner-exit lag).
     // NOTE: the GPS-velocity heading gain MUST remain non-trivial at low speed
     // (e.g. v=1 m/s) — it is the signal that lets magnetic-declination calibrate
     // (the mag-vs-GPS-velocity heading disagreement is absorbed into magDeclination).
-    // Zeroing it below ~1.5 m/s would make magDeclination unobservable at rest, a
-    // documented feature. In practice low-speed GPS-velocity heading jitter is already
-    // negligible when a magnetometer is present (the mag owns heading there), and the
-    // per-component velRobustW + stationary decouple further suppress noisy Doppler.
-    let headingGain = v < 0.5 ? 0 : Math.min((v - 0.5 + this.gyroEnergy * 0.5 + this.stepEnergy * 1.5) / 3.5, 1);
+    let headingGain = v < 0.2 ? 0 : Math.min((v - 0.2 + this.gyroEnergy * 0.5 + this.stepEnergy * 1.5 + this.smoothAngAccel * 0.5) / 2.8, 1);
 
     // Adaptive initialization boost: during first 30s after GPS init, if heading
     // variance is high, temporarily boost GPS correction to accelerate convergence.

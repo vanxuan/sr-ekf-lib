@@ -62,19 +62,20 @@ else:
   x' = x + v̅·cos(α)·dt
   y' = y + v̅·sin(α)·dt
 
-v'  = v + a_forward·dt
+v'  = max(0, v + a_forward·dt)   (hard-clamped in predict)
 ψ'  = ψ + ω̅·dt·omegaScale, where ω̅ = ½(ω_prev + ω_curr)
 β'  = β · exp(−dt/τ)   (mean-reversion toward 0)
-τ = base × (1 − 0.6 × angAccelNorm) × (1 − 0.5 × stepEnergy), where base = |v| < 0.3 ? 0.1 : (|ω| > ε ? 1.5 : max(0.5, 1.5 − (|v|−1.5) / 3.5)), angAccelNorm = min(|dω/dt| / 3.0, 1)
+τ = base × (1 − 0.6 × angAccelNorm) × (1 − 0.5 × stepEnergy), where base = |v| < 0.3 ? 0.1 : (|ω| > ε ? 1.5 : max(0.5, 1.5 − (|v|−1.5) / 3.5)), angAccelNorm = min(smoothAngAccel / 3.0, 1)
 a_bias_x' = a_bias_x · exp(−dt/50)   (mean-reversion when accelEnergy < 0.05)
 g_bias_z' = g_bias_z   (random walk, corrected by ZARU during stationary)
 magDeclination' = magDeclination   (random walk)
 ```
 
 - **v̅ = v + ½·a·dt**: Uses the average velocity over the timestep (instead of start-of-step v) in the CTRA position deltas. For straight-line motion this makes the position integration exact for constant acceleration. Jacobian entries for position derivatives (`∂x/∂ψ`, `∂x/∂β`, `∂x/∂g_bias_z`, and y-sym) also use `v̅` and `ω̅` to match the forward model; `∂x/∂a_bias_x = -½·dt·∂x/∂v` and `∂y/∂a_bias_x = -½·dt·∂y/∂v` remain correct because `∂x/∂v = ∂x/∂v̅`.
- - **v is no longer hard-clamped to ≥ 0 in `predict`**: Removed `Math.max(0, v)` from predict, lateral accel/ZUPT scalar QR, and ZARU so the filter can express genuine reverse motion. However, the GPS update maintains the invariant **v ≥ 0** with **ψ = direction of motion**: (1) the 180° flip-recovery fires on anti-parallel GPS velocity whenever `v > 0.8` (no position-χ² gate needed), flipping ψ by π before v can go negative; and (2) a post-update backstop reparameterizes any residual `v < 0` into the equivalent `(−v, ψ+π, β+π)` branch (velocity vector unchanged), with the V row/column of the Cholesky factor sign-flipped. This eliminates the reported "U-turn → negative velocity / heading snaps to nose" symptom. All speed-dependent calculations consistently use `Math.abs(v)`: `speedScale`, `maxPlausibleSpeed`, β time constant `|v|<0.3`, lateral accel gate `|v|>0.2`, outlier guard, `speedRamp`, `velFactor`, etc.
+ - **v ≥ 0 invariant with ψ = direction of motion**: `predict` hard-clamps `v' = max(0, v + a·dt)`, so IMU prediction can never drive v negative. The scalar-QR Kalman pseudo-measurements (lateral accel, nonholonomic, ZUPT, ZARU, coasting velocity prior/damping) never clamp v — they pull it naturally via the innovation. The GPS update maintains the invariant in two ways: (1) the 180° flip-recovery fires on anti-parallel GPS velocity whenever `v > 0.8` (no position-χ² gate needed), flipping ψ by π before v can go negative; and (2) a post-update backstop reparameterizes any residual `v < 0` into the equivalent `(−v, ψ+π, β+π)` branch (velocity vector unchanged), with the V row/column of the Cholesky factor sign-flipped. This eliminates the reported "U-turn → negative velocity / heading snaps to nose" symptom. All speed-dependent calculations consistently use `Math.abs(v)`: `speedScale`, `maxPlausibleSpeed`, β time constant `|v|<0.3`, lateral accel gate `|v|>0.2`, outlier guard, `speedRamp`, `stationaryWeight` hybrid speed, `vehMoving`, etc.
 - **a_bias_x mean-reversion**: When `accelEnergy < 0.05` (near-zero dynamic acceleration), the bias drifts toward zero with a 50s time constant. This prevents unbounded bias drift during extended constant-speed travel, which would otherwise cause velocity overshoot during GPS outages. Jacobian `F[A_BIAS_X][A_BIAS_X] = exp(−dt/50)` mirrors the state decay.
 - **Trapezoidal Heading Integration**: Heading ψ is integrated using the average turn rate `ω̅ = ½(ω_prev + ω_curr)` over the interval `dt`. This reduces heading lag and overshoot during angular transients (corner entry/exit) compared to forward-Euler integration. Position integration via `ctraDelta` also uses `ω̅` for consistency.
+- **omegaScale heading damping**: `ψ' = ψ + ω̅·dt·omegaScale` where `omegaScale = vehMoving > 0 ? max(vehMoving, stillness) : 1` and `vehMoving = min(|v|/0.5, 1)`. Dampens heading integration at very low speed (0 < |v| < 0.5) when the device is not still, but keeps full integration when stationary (`vehMoving = 0` → `omegaScale = 1`) so rest rotations are still tracked.
 
 ### GPS Measurement Model
 
@@ -97,11 +98,11 @@ Decomposes the GPS position innovation into along-track (forward) and cross-trac
 - **Forward**: `maxPlausibleSpeed = max(2v, 1) + 2`, threshold = `maxPlausibleSpeed × dtBase × 2`, cap at 5× — trusts forward motion more
 - **Cross-track**: threshold = `maxPlausibleSpeed × dtBase × 0.5`, cap at 10× — cross-track jumps (typical GPS multipath) are penalized more aggressively
 
-The guard inflates `posR` multiplicatively, widening the measurement uncertainty rather than rejecting the measurement outright.
+The guard inflates `posR` multiplicatively, widening the measurement uncertainty rather than rejecting the measurement outright. Both thresholds have posR-scaled floors — `minForward = max(posR·2, 1.0)`, `minCross = max(posR·0.5, 0.5)` — and each threshold is `max(plausible, floor)` so a high GPS accuracy (large posR) doesn't trigger inflation on every fix.
 
 ### Separate Position/Velocity χ² Gating
 
-The 4-DOF joint Mahalanobis gate (`chiSq < gateThreshold`) is augmented with a 2-DOF position-only χ²: if position alone passes but velocity fails, the update is still accepted. This prevents noisy GPS velocity from blocking valid position corrections at low speeds where velocity error dominates. The position-only χ² uses the same anisotropic noise model (along-track 0.5·posR, cross-track 1.33·posR, heading-rotated) as the main update for gating consistency. **Note**: this separate gating is only active when robust M-estimation is disabled (`!rw.enabled`); when robust weighting is enabled, the re-weighted chiSq is always accepted and the separate gate is bypassed.
+The 4-DOF joint Mahalanobis gate (`chiSq < gateThreshold`) is augmented with a 2-DOF position-only χ²: if position alone passes but velocity fails, the update is still accepted. This prevents noisy GPS velocity from blocking valid position corrections at low speeds where velocity error dominates. The position-only χ² uses the same anisotropic noise model (along-track 0.5·posR, cross-track 1.33·posR, heading-rotated) as the main update for gating consistency. **Note**: this separate gating is active when robust M-estimation is disabled (`!rw.enabled`) **or** the re-weighted total is heavily down-weighted (`totalWeight < 0.1`); otherwise the re-weighted chiSq is always accepted and the separate gate is bypassed. While coasting, a failing gate (whether the position sub-gate passes or both fail) forces a `resetFromGps()` instead of rejection, so the filter snaps to the first valid fix after GPS loss.
 
 ### Anisotropic GPS Covariance
 
@@ -132,15 +133,15 @@ When GPS timestamps lag behind IMU time, the filter rewinds state to the GPS tim
 
 **Buffer**: Circular buffer of predict states (x, S, IMU inputs, dt, orientation angles). Saved on every `predict()` call, up to 256 entries. Orientation angles (azimuth, pitch, roll) are stored so that `replayFromScratch()` can reconstruct the historical rotation matrix for each replayed step, preventing state corruption if the device orientation changed during the latency window. On rewind, the buffer preserves prior history (`bufTail` unchanged, `bufLen` truncated to the restored index) rather than clearing entirely, enabling subsequent rewind operations for later delayed GPS measurements.
 
-**Critical safeguard**: After rewind, if the position discrepancy between the restored state and the incoming GPS exceeds 10m (>100 m²), the GPS position is applied directly. This handles the case where the buffer only contains pre-GPS-init states, preventing the filter from being stuck far from the true position with an inflated outlier guard.
+**Critical safeguard**: After rewind, if the position discrepancy between the restored state and the incoming GPS exceeds 10m (>100 m²), the GPS position is applied directly. If coasting at the time, v, ψ, and β are also re-initialized from the GPS velocity. This handles the case where the buffer only contains pre-GPS-init states, preventing the filter from being stuck far from the true position with an inflated outlier guard.
 
 ### Small-ω Jacobian Continuity Fix
 
 When `|ω| ≤ EPS`, the small-ω Jacobian now includes gyro bias derivatives so that position innovation can drive `g_bias_z` correction even during straight-line motion:
 
 ```
-∂x'/∂g_bias_z = 0.5·v̅·sin(α)·dt²
-∂y'/∂g_bias_z = -0.5·v̅·cos(α)·dt²
+∂x'/∂g_bias_z = -0.5·v̅·sin(α)·dt²
+∂y'/∂g_bias_z = 0.5·v̅·cos(α)·dt²
 ```
 
 All position derivatives (`∂x/∂ψ`, `∂x/∂β`, `∂x/∂g_bias_z`, and y-sym) use `v̅ = v + ½·a·dt` in both the big-ω and small-ω branches, matching the CTRA position kinematics. Without these terms, `g_bias_z` was only correctable during turns, causing observability gaps during long straight segments.
@@ -163,7 +164,7 @@ Scales applied multiplicatively to process noise diagonals:
 - AccelBias: no scaling (pure random walk)
 - GyroBias: `× (1 + 0.3 × gyroEnergy + 0.5 × angAccelBoost)`
 
-Where `angAccelBoost = min(|dω/dt| / 2.0, 1)` — ramps 0→1 for angular acceleration 0→2 rad/s². Zero on straights, full during corner entry/exit.
+Where `angAccelBoost = min(smoothAngAccel / 2.0, 1)` — ramps 0→1 for angular acceleration 0→2 rad/s². Zero on straights, full during corner entry/exit. `smoothAngAccel` is an EMA-sustained `|dω/dt|` (`smoothAngAccel = max(|dω/dt|, prev · exp(−dt/0.5))`), keeping the boost alive ~0.5s after a transient ends so corner-exit corrections aren't cut off abruptly.
 
 Configurable via `adaptiveScaling` (defaults tuned for handheld/wearable):
 ```ts
@@ -203,7 +204,7 @@ Configurable via `adaptiveScaling` (defaults tuned for handheld/wearable):
 ### Sideslip Angle (β)
 - 6th state captures the difference between vehicle heading (ψ) and velocity direction (ψ+β)
 - Arises from tire slip during turns; GPS velocity direction vs gyro-integrated heading gives observability
-- Mean-reversion toward 0 with speed/yaw-rate-dependent time constant: base `τ = |v| < 0.3 ? 0.1 : (|ω| > ε ? 1.5 : max(0.5, 1.5 − (|v|−1.5) / 3.5))` s, then multiplied by `(1 − 0.6 × angAccelNorm)` where `angAccelNorm = min(|dω/dt| / 3.0, 1)` — at max angular acceleration (3 rad/s²), τ drops to 40% of its base value (e.g. 1.5s → 0.6s during turns). This allows β to track the rapidly changing slip angle at corner entry/exit instead of lagging and corrupting heading. Jacobian `computeJacobian()` uses the same modulated τ.
+- Mean-reversion toward 0 with speed/yaw-rate-dependent time constant: base `τ = |v| < 0.3 ? 0.1 : (|ω| > ε ? 1.5 : max(0.5, 1.5 − (|v|−1.5) / 3.5))` s, then multiplied by `(1 − 0.6 × angAccelNorm)` where `angAccelNorm = min(smoothAngAccel / 3.0, 1)` — at max angular acceleration (3 rad/s²), τ drops to 40% of its base value (e.g. 1.5s → 0.6s during turns). This allows β to track the rapidly changing slip angle at corner entry/exit instead of lagging and corrupting heading. Jacobian `computeJacobian()` uses the same modulated τ.
 - Jacobian ∂/∂β = ∂/∂ψ (ψ and β appear symmetrically in position/velocity kinematics)
 - Process noise scaled by IMU energy and angular acceleration (via adaptive scaling)
 
@@ -211,8 +212,8 @@ Configurable via `adaptiveScaling` (defaults tuned for handheld/wearable):
 
 Tracks `|dω/dt|` (angular acceleration magnitude) by differencing consecutive bias-corrected gyro rates. Clamped to [0, 10] rad/s². Drives three mechanisms that prevent heading from "getting stuck" at corner transitions:
 
-1. **Q boost** (`angAccelBoost = min(|dω/dt|/2, 1)`): Inflates heading Q by ×(1+1.5·boost), sideslip Q by ×(1+2·boost), and gyro bias Q by ×(1+0.5·boost) during transients. Zero on straights, full at 2 rad/s². Allows faster state correction when the CTRA model is least accurate.
-2. **Faster β adaptation**: Modulates sideslip time constant by `(1 − 0.6·angAccelNorm)` where `angAccelNorm = min(|dω/dt|/3, 1)`. At max angular acceleration, β converges 2.5× faster (τ=0.6s vs 1.5s), preventing sideslip lag from corrupting heading during corner entry.
+1. **Q boost** (`angAccelBoost = min(smoothAngAccel/2, 1)`): Inflates heading Q by ×(1+1.5·boost), sideslip Q by ×(1+2·boost), and gyro bias Q by ×(1+0.5·boost) during transients. Zero on straights, full at 2 rad/s². Allows faster state correction when the CTRA model is least accurate.
+2. **Faster β adaptation**: Modulates sideslip time constant by `(1 − 0.6·angAccelNorm)` where `angAccelNorm = min(smoothAngAccel/3, 1)`. At max angular acceleration, β converges 2.5× faster (τ=0.6s vs 1.5s), preventing sideslip lag from corrupting heading during corner entry.
 3. **Gyro bias Q boost**: Extra process noise on gyro bias during transients allows GPS velocity direction to correct accumulated bias errors that would otherwise cause heading overshoot at corner exit.
 
 ### Speed-Scaled Process Noise
@@ -223,8 +224,8 @@ Tracks `|dω/dt|` (angular acceleration magnitude) by differencing consecutive b
 
 ### Frame Alignment
 - `setOrientation(azimuth, pitch, roll)` sets device-to-ENU rotation matrix using Z-X-Y Euler sequence (matches W3C DeviceOrientation convention): pitch around X-axis (front-to-back), roll around Y-axis (left-to-right), azimuth clockwise-positive around Z (compass heading)
-- When orientation is set, a **6-axis IMU (including az) is required** — omitting `az` causes NaN propagation as a guard against gravity leakage
-- Bias reset (a_bias_x, g_bias_z → 0 with fresh covariance) only triggers when the device orientation changes **relative to the vehicle** (>5° over 1s in device-to-vehicle frame, factoring out heading changes). This prevents vehicle turns from destroying learned bias calibration
+- When orientation is set, a **6-axis IMU (including az) is required** — omitting `az` throws an `Error` ("6-axis IMU required when device orientation is set") as a guard against gravity leakage
+- Bias reset (a_bias_x, g_bias_z → 0 with fresh covariance) only triggers when the device orientation changes **relative to the vehicle** (`(trace−1)/2 < 0.996`, i.e. >5° rotation of the device in the device-to-vehicle frame on any `setOrientation()` call, factoring out heading changes). This prevents vehicle turns from destroying learned bias calibration
 - Orientation angles are stored alongside raw IMU in the latency compensation buffer, so rewind/replay correctly reconstructs the historical rotation matrix for each buffered step
 
 ### Low-Speed Jump Protection (Urban Multipath)
@@ -232,9 +233,9 @@ Tracks `|dω/dt|` (angular acceleration magnitude) by differencing consecutive b
 Two defenses prevent position/heading jumps from noisy GPS in low-speed city environments:
 
 1. **Tighter position outlier guard**: Uses `maxPlausibleSpeed = max(2·|v|, 1) + 2` (instead of `max(v, 5) + 20`) with `×2` multiplier (instead of `×5`), capping inflation at 5× forward and 10× cross-track. At walking speed and 1 Hz GPS, a 5m jump inflates posR by 1.7×; a 20m jump inflates by 8.3×
-2. **Smooth heading gating**: GPS velocity heading correction ramps from 0 at v=0.5 to full via `headingGain = v < 0.5 ? 0 : min((v − 0.5 + gyroEnergy × 0.5 + stepEnergy × 1.5) / 3.5, 1)`, applied to `H[2:3, PSI/BETA]`. The gyroEnergy and stepEnergy terms allow faster convergence when the device is actively turning or walking (confirms real motion). During the first 30 seconds after GPS initialization, an adaptive init boost further increases headingGain by up to 2× when heading uncertainty is high (`psiStd > 0.3 rad`), accelerating convergence from a cold start. Prevents hard-threshold discontinuity while still avoiding heading corruption from noisy GPS direction at near-zero speed. Position innovation still corrects heading through position-heading cross-covariance at all speeds
+2. **Smooth heading gating**: GPS velocity heading correction ramps from 0 at v=0.2 to full via `headingGain = v < 0.2 ? 0 : min((v − 0.2 + gyroEnergy × 0.5 + stepEnergy × 1.5 + smoothAngAccel × 0.5) / 2.8, 1)`, applied to `H[2:3, PSI/BETA]`. The gyroEnergy and stepEnergy terms allow faster convergence when the device is actively turning or walking (confirms real motion). During the first 30 seconds after GPS initialization, an adaptive init boost further increases headingGain by up to 2× when heading uncertainty is high (`psiStd > 0.3 rad`), accelerating convergence from a cold start. Prevents hard-threshold discontinuity while still avoiding heading corruption from noisy GPS direction at near-zero speed. Position innovation still corrects heading through position-heading cross-covariance at all speeds
 3. **GPS heading init gate lowered** (line 357): `spd > 0.1` — catches even very slow movement for heading initialization from GPS velocity direction
- 4. **180° flip recovery gate relaxed** (src/sr-ekf.ts `gpsUpdateSingle`): now fires on anti-parallel GPS velocity (`dot < -0.5·v²`) whenever `v > 0.8`, with **no position-χ² gate requirement** (previously required `chiSq > gateThreshold`). The strict anti-parallel dot-product check still prevents misfire on 90° pedestrian turns (which only trigger at >120° separation). This catches pure velocity-direction reversals — e.g. urban Doppler multipath or a U-turn where position stays consistent but velocity flips — which previously were not corrected and resolved into a negative-v state. A post-update backstop then reparameterizes any residual `v < 0` into the `(−v, ψ+π, β+π)` branch so `v ≥ 0` always holds with `ψ` = direction of motion. The backstop only reparameterizes when `|v| ≥ 0.5 m/s`; at negligible speed (stationary device) it merely clamps `v` to 0 without flipping ψ. Otherwise, GPS velocity *noise* at rest drives `v` to tiny negative values and the π-flip would make the heading shake 180° every step.
+ 4. **180° flip recovery gate relaxed** (src/sr-ekf.ts `gpsUpdateSingle`): now fires on anti-parallel GPS velocity (`dot < -0.5·v²`, measured speed > 1 m/s) whenever `v > 0.8`, with **no position-χ² gate requirement** (previously required `chiSq > gateThreshold`). The strict anti-parallel dot-product check still prevents misfire on 90° pedestrian turns (which only trigger at >120° separation). This catches pure velocity-direction reversals — e.g. urban Doppler multipath or a U-turn where position stays consistent but velocity flips — which previously were not corrected and resolved into a negative-v state. A post-update backstop then reparameterizes any residual `v < 0` into the `(−v, ψ+π, β+π)` branch so `v ≥ 0` always holds with `ψ` = direction of motion. The backstop only reparameterizes when `|v| ≥ 0.5 m/s`; at negligible speed (stationary device) it merely clamps `v` to 0 without flipping ψ. Otherwise, GPS velocity *noise* at rest drives `v` to tiny negative values and the π-flip would make the heading shake 180° every step.
 5. **Rest-weighted velocity H blocking**: When IMU energy is near zero (`accelEnergy + gyroEnergy < 0.05`), the GPS velocity heading columns (`H[2:3][PSI/BETA]`) are smoothly reduced by a speed-dependent factor `(1 − restW)` where `restW = clamp((1.5 − |v|) / 1.0, 0, 1)`. At rest this completely blocks GPS velocity from rotating ψ, handing authority to the magnetometer. At speed the blocking fades, allowing GPS velocity direction to own heading.
 
 ### Lateral Acceleration Constraint
@@ -256,14 +257,14 @@ Two defenses prevent position/heading jumps from noisy GPS in low-speed city env
 
 ### GPS Initialization
 
-On the first `updateGps()` call after `reset()`, the filter snaps position directly to the GPS fix (no Kalman update). Heading and velocity are initialized from GPS velocity direction when `|v| > 0.1` m/s (low threshold catches slow-walking pedestrians). **Covariance is tightened** to reflect GPS-derived knowledge — position σ set to `min(current, accuracyMeters/3)` (default 3m if no accuracy reported), velocity σ capped at 0.5 m/s, heading σ capped at 0.3 rad (~17°) when velocity-initialized. Without this, the default `initialCovariance.position=100` (σ=10m) persists after init, letting IMU drift accumulate rapidly between GPS fixes and causing the direction-aware guard to reject valid subsequent fixes.
+On the first `updateGps()` call after `reset()`, the filter snaps position directly to the GPS fix (no Kalman update). Heading and velocity are initialized from GPS velocity direction when `|v| > 0.1` m/s (low threshold catches slow-walking pedestrians). **Covariance is tightened** to reflect GPS-derived knowledge — position σ set to `min(current, max(accuracyMeters/3, 1))` (default 3m if no accuracy reported; floored at 1m), velocity σ capped at 0.5 m/s, heading σ capped at 0.3 rad (~17°) when velocity-initialized. Without this, the default `initialCovariance.position=100` (σ=10m) persists after init, letting IMU drift accumulate rapidly between GPS fixes and causing the direction-aware guard to reject valid subsequent fixes.
 
 ### Coast Recovery
 - When coasting and GPS gate rejects, `resetFromGps()` resets state + Cholesky from GPS fix directly; position σ capped at 5m via `min(current, 5)`
 - **Biases preserved across GPS re-acquisition**: `resetFromGps()` keeps the learned `aBiasX`, `gBiasZ`, and `magDeclination` values and their covariances — only kinematic states (x, y, v, ψ, β) are reset. This prevents tunnel exit from discarding the bias calibration learned during coasting via ZUPT/ZARU, eliminating the "fresh drift" symptom after GPS recovery.
 - Deduplicated from 3 copies into single private method
 - **Guard-inflation-masking reset**: If the outlier guard inflates `posR` by >3× (`posR / preGuardPosR > 3`) and the position jump is physically plausible (`dxNorm < dtSinceLastGps × 50 + 2`), the GPS fix is accepted directly via `resetFromGps()` if the device is moving (`|v| > 0.5 m/s`) or the jump is large (`dxNorm > 15m`). This prevents the inflated R from reducing Kalman gain to near-zero, which previously caused minute-long convergence ("stuck car" symptom).
-- **Auto-divergence detection**: When NOT coasting and the previous GPS gate failed (or was heavily down-weighted by Huber, `robustWeight < 0.05`), if position error exceeds 50m (2500 m²), the filter force-enters coasting to trigger a full reset on the next GPS fix — catches cases where the state has clearly diverged (e.g. basement exit).
+- **Auto-divergence detection**: When NOT coasting and the previous GPS gate failed (or was heavily down-weighted by Huber, `robustWeight < 0.05`), if position error exceeds 100m (10000 m²), the filter force-enters coasting to trigger a full reset on the next GPS fix — catches cases where the state has clearly diverged (e.g. basement exit).
 - **Post-update large position reset**: After a successful GPS update, if the resulting position error exceeds 10km² (1e8 m²), a hard reset from GPS is applied — catches catastrophic Cholesky corruption
 - **Robustness in Coasting**: In `gpsUpdateSingle`, if `coasting` is true, a `resetFromGps()` is triggered if the GPS innovation is statistically implausible (`chiSq > gateThreshold`), even when Huber robust weighting is enabled. This ensures the filter snaps to the first valid GPS after a gap rather than stalling with a low Huber weight.
 
@@ -358,9 +359,25 @@ class SrEkf {
 
   getState(): NavigationSolution
 
+  getStateInto(out: NavigationSolution): void   // zero-allocation state read
+
+  getStillness(): number   // 0 = in motion, 1 = at rest (IMU 3D-variance based)
+
+  getImuStats(): { n: number; meanAxRel: number; stdAx: number;
+                   meanGzRel: number; stdGz: number; lastOmega: number }
+
+  getDebug(): { stillness: number; aBiasX: number; gBiasZ: number; v: number;
+                psiDeg: number; zuptWeight: number; speedGate: number; accelGate: number;
+                n: number; magRejectCount: number; magTrust: number; magInnovDeg: number;
+                gateThreshDeg: number; magAlpha: number }
+
   getDiagnostics(): EkfDiagnostics
 
   reset(x: number, y: number, v: number, psi: number): void
+
+  resetBiases(aBiasX?: number, gBiasZ?: number): void
+
+  inflateCovariance(params: { position?: number; heading?: number }): void
 }
 
 interface NavigationSolution {
@@ -405,6 +422,6 @@ Designed for 50–400 Hz IMU and 1–10 Hz GPS on resource-constrained devices:
 ## Validation
 
 ```bash
-npm test                 # 72 tests (9 QR verification + 63 unit)
+npm test                 # 74 tests (9 QR verification + 65 unit)
 npm run test:watch       # watch mode
 ```
