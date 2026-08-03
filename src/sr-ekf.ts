@@ -554,18 +554,16 @@ export class SrEkf {
           this.x[i] += p / sInnov * innov;
         }
         this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
-        // QR covariance update: S ← QR([R_damp, 0; H·S, S]) extracting S from lower-right
-        const qr = this.tmpLatPre;
-        for (let i = 0; i <= N; i++) for (let j = 0; j < N; j++) qr[i][j] = 0;
-        qr[0][0] = rDamp;
-        for (let j = 0; j < N; j++) qr[1][j] = SV[j];
-        for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) qr[i + 1][j] = this.S[i][j];
-        this.qrInPlace(qr, N + 1, N, this.tmpHouseV);
-        for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) this.S[i][j] = qr[i + 1][j];
-        ensureDiag(this.S);
-        let tr = 0;
-        for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) { const v = this.S[i][j]; tr += v * v; }
-        this._traceCache = tr;
+        // QR covariance update (scalar QR, same pattern as lateral-accel/mag)
+        const A = this.tmpLatPre;
+        for (let i = 0; i < MAG_PRE; i++) A[i].fill(0);
+        A[0][0] = rDamp;
+        for (let j = 0; j < N; j++) A[1 + j][0] = SV[j];
+        for (let i = 0; i < N; i++)
+          for (let j = 0; j < N; j++)
+            A[1 + i][1 + j] = this.S[j][i];
+        this.qrInPlace(A, MAG_PRE, MAG_PRE, this.tmpHouseV);
+        this.copySfromQR(A, 1);
       }
     }
     // Velocity prior during coasting: when GPS is lost and the car is moving
@@ -593,18 +591,16 @@ export class SrEkf {
           this.x[i] += p / sInnov * innov;
         }
         this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
-        // QR covariance update
-        const qr = this.tmpLatPre;
-        for (let i = 0; i <= N; i++) for (let j = 0; j < N; j++) qr[i][j] = 0;
-        qr[0][0] = rPrior;
-        for (let j = 0; j < N; j++) qr[1][j] = SV[j];
-        for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) qr[i + 1][j] = this.S[i][j];
-        this.qrInPlace(qr, N + 1, N, this.tmpHouseV);
-        for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) this.S[i][j] = qr[i + 1][j];
-        ensureDiag(this.S);
-        let tr = 0;
-        for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) { const v = this.S[i][j]; tr += v * v; }
-        this._traceCache = tr;
+        // QR covariance update (scalar QR, same pattern as lateral-accel/mag)
+        const A = this.tmpLatPre;
+        for (let i = 0; i < MAG_PRE; i++) A[i].fill(0);
+        A[0][0] = rPrior;
+        for (let j = 0; j < N; j++) A[1 + j][0] = SV[j];
+        for (let i = 0; i < N; i++)
+          for (let j = 0; j < N; j++)
+            A[1 + i][1 + j] = this.S[j][i];
+        this.qrInPlace(A, MAG_PRE, MAG_PRE, this.tmpHouseV);
+        this.copySfromQR(A, 1);
       }
     }
 
@@ -879,18 +875,16 @@ export class SrEkf {
       this.x[i] += p / sInnov * innov;
     }
     this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
-    // QR covariance update (scalar QR)
-    const qr = this.tmpLatPre;
-    for (let i = 0; i < MAG_PRE; i++) for (let j = 0; j < N; j++) qr[i][j] = 0;
-    qr[0][0] = rBaro;
-    for (let j = 0; j < N; j++) qr[1][j] = hs[j];
-    for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) qr[i + 1][j] = this.S[i][j];
-    this.qrInPlace(qr, MAG_PRE, MAG_PRE, this.tmpHouseV);
-    for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) this.S[i][j] = qr[i + 1][j];
-    ensureDiag(this.S);
-    let tr = 0;
-    for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) { const v = this.S[i][j]; tr += v * v; }
-    this._traceCache = tr;
+    // QR covariance update (scalar QR, same pattern as lateral-accel/mag)
+    const A = this.tmpLatPre;
+    for (let i = 0; i < MAG_PRE; i++) A[i].fill(0);
+    A[0][0] = rBaro;
+    for (let j = 0; j < N; j++) A[1 + j][0] = hs[j];
+    for (let i = 0; i < N; i++)
+      for (let j = 0; j < N; j++)
+        A[1 + i][1 + j] = this.S[j][i];
+    this.qrInPlace(A, MAG_PRE, MAG_PRE, this.tmpHouseV);
+    this.copySfromQR(A, 1);
   }
 
   updateMag(bearing: number, timestampMs: number): void {
