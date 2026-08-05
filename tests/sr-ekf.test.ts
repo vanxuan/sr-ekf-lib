@@ -1301,6 +1301,100 @@ describe('SrEkf', () => {
     expect(maxHeadingError * 180 / Math.PI).toBeLessThan(5.0)
   })
 
+  it('should not let a misaligned compass drag heading during a low-speed corner', () => {
+    // Regression: at low speed (v≈1.1 m/s) the mag trust gate is still active
+    // (magHeadingTrust = 1 - v/1.5 ≈ 0.27 > 0.2), so a compass with a constant
+    // offset used to fight the GPS velocity-direction update and drag ψ toward
+    // the wrong bearing — the "heading stuck at corner entry" symptom. During a
+    // gyro-confirmed rotation the mag update must be skipped so the gyro (and
+    // GPS at speed) own the turn; the compass re-anchors once rotation stops.
+    const run = (magMode: 'offset' | 'stale', seedInit: number) => {
+      const ekf = new SrEkf({ measurementNoise: { position: 3.0, velocity: 0.5, heading: 0.1 } })
+      ekf.reset(0, 0, 0, 0)
+      const dt = 0.02, T = 16, gbias = 0.03, abias = 0.05
+      let seed = seedInit >>> 0
+      const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296 }
+      const getV = (t: number) => t < 3 ? 5.0 : t < 5 ? 5.0 - (t - 3) * 2.0 : t < 8 ? 1.0 : t < 10 ? 1.0 + (t - 8) * 2.0 : 5.0
+      const getW = (t: number) => t < 5 ? 0 : (t < 6 ? (t - 5) * 0.35 : (t < 9 ? 0.35 : (t < 10 ? 0.35 - (t - 9) * 0.35 : 0)))
+      const pts: { t: number; psi: number; x: number; y: number; v: number; a: number }[] = []
+      let time = 0, psi = 0, x = 0, y = 0, vPrev = getV(0)
+      while (time < T) {
+        const v = getV(time), w = getW(time)
+        const a = (v - vPrev) / dt
+        psi += w * dt; x += v * Math.cos(psi) * dt; y += v * Math.sin(psi) * dt
+        vPrev = v
+        time += dt
+        pts.push({ t: time, psi, x, y, v, a })
+      }
+      ekf.updateGps(0, 0, pts[0].v, 0, 0)
+      const entryBearing = pts.find(p => p.t >= 5.2)!.psi
+      const deliver: { at: number; t: number; x: number; y: number; vx: number; vy: number }[] = []
+      let nextFixT = 0, lastMagT = -1
+      let maxErrDeg = 0
+      for (const p of pts) {
+        time = p.t
+        if (p.t >= nextFixT) {
+          deliver.push({ at: nextFixT + 0.5, t: nextFixT, x: p.x, y: p.y, vx: p.v * Math.cos(p.psi), vy: p.v * Math.sin(p.psi) })
+          nextFixT += 1
+        }
+        const wE = getW(time)
+        ekf.predict(p.a + abias, p.v * wE, wE + gbias, dt, time * 1000)
+        if (time - lastMagT >= 0.05) {
+          const bearing = magMode === 'offset'
+            ? p.psi + 30 * Math.PI / 180
+            : entryBearing
+          ekf.updateMag(bearing + (rnd() - 0.5) * 2 * 3 * Math.PI / 180, time * 1000)
+          lastMagT = time
+        }
+        while (deliver.length > 0 && deliver[0].at <= time) {
+          const d = deliver.shift()!
+          const av = (rnd() - 0.5) * 2 * 0.1
+          const sp = Math.sqrt(d.vx * d.vx + d.vy * d.vy)
+          const a0 = Math.atan2(d.vy, d.vx)
+          ekf.updateGps(
+            d.x + (rnd() - 0.5) * 1.0, d.y + (rnd() - 0.5) * 1.0,
+            sp * Math.cos(a0) + av, sp * Math.sin(a0) + av, d.t * 1000
+          )
+        }
+        const s = ekf.getState()
+        const err = Math.abs((s.psi - p.psi + 3 * Math.PI) % (2 * Math.PI) - Math.PI)
+        maxErrDeg = Math.max(maxErrDeg, err * 180 / Math.PI)
+      }
+      return maxErrDeg
+    }
+    let worstOffset = 0, worstStale = 0
+    for (let k = 0; k < 5; k++) {
+      worstOffset = Math.max(worstOffset, run('offset', 12345 + k * 777))
+      worstStale = Math.max(worstStale, run('stale', 12345 + k * 777))
+    }
+    // A compass offset/staleness must not be able to drag ψ more than a few
+    // degrees during the corner (previously ~10-17°, up to 90° at crawl speed).
+    expect(worstOffset).toBeLessThan(5)
+    expect(worstStale).toBeLessThan(5)
+  })
+
+  it('should track a genuine table rotation via gyro and re-anchor to the compass after it stops', () => {
+    // Guard for the gyro-confirmed rotation guard: while |ω| > 0.05 the mag
+    // update is skipped, so a real rest rotation (mag bearing rotating in step
+    // with the gyro) must still be tracked by gyro integration alone, and the
+    // heading must converge back to the (stable) compass once rotation stops.
+    const ekf = new SrEkf({ measurementNoise: { heading: 0.1 } })
+    ekf.reset(0, 0, 0, 0)
+    const omega = 0.5, dt = 0.02
+    for (let i = 0; i < 150; i++) {
+      const t = i * dt
+      ekf.predict(0, 0, omega, dt, Math.round(t * 1000))
+      ekf.updateMag(omega * t, Math.round(t * 1000))
+    }
+    expect(Math.abs(ekf.getState().psi - 1.5)).toBeLessThan(0.15)
+    for (let i = 150; i < 200; i++) ekf.predict(0, 0, 0, dt, Math.round(i * dt * 1000))
+    for (let i = 200; i < 700; i++) {
+      ekf.predict(0, 0, 0, dt, Math.round(i * dt * 1000))
+      ekf.updateMag(0.3, Math.round(i * dt * 1000))
+    }
+    expect(Math.abs(ekf.getState().psi - 0.3)).toBeLessThan(0.05)
+  })
+
   it('should track heading and velocity during walking with step-induced energy', () => {
     const ekf = new SrEkf()
     ekf.reset(0, 0, 0, 0)

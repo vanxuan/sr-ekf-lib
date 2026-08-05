@@ -1841,6 +1841,21 @@ if (absOmega > EPS) {
     this.prevCallMagBearing = bearing;
     this.prevCallMagTimeMs = this.lastMagTimeMs;
 
+    // Gyro-confirmed rotation guard: when the gyro measures a genuine rotation
+    // (|ω| > 0.05 rad/s), the gyro is the reliable heading reference and a stale
+    // or lagging compass must not yank ψ back toward the corner-entry direction —
+    // the reported "heading stuck at corner entry, then snapping to the moving
+    // direction" bug. At low speed the EKF velocity can read ≈0 (ZUPT drags v to
+    // ~0 during a crawl corner), so the v-based protections above (trust gate,
+    // restMag direct blend, widened drift margin) are all ineffective exactly when
+    // the car is genuinely rotating. Gate the mag's ψ-correction on the GYRO rate
+    // instead: skip the update (blend AND Kalman branches) while rotating and let
+    // the gyro integrate the turn; the compass re-anchors once rotation stops.
+    // This only fires when the gyro actually reports rotation — on devices where
+    // the gyro yaw rate is unavailable at rest, |ω|≈0 and the mag keeps full
+    // authority for phone-rotation tracking on a table.
+    if (Math.abs(this.lastOmega) > 0.05) return;
+
     // magHeadingTrust: 1 at low speed (mag owns ψ for init and backup), → 0 at
     // speed (GPS owns live heading ψ via its velocity-direction measurement).
     // At speed the magnetometer is SKIPPED entirely (including the init snap),
