@@ -901,6 +901,11 @@ export class SrEkf {
     return true;
   }
 
+  /** True once the first GPS fix has initialized the filter. */
+  isGpsInitialized(): boolean {
+    return this.gpsInitialized;
+  }
+
   getState(): NavigationSolution {
     return {
       x: this.x[I.X], y: this.x[I.Y], v: this.x[I.V], psi: this.x[I.PSI], beta: this.x[I.BETA],
@@ -1854,7 +1859,17 @@ if (absOmega > EPS) {
     // This only fires when the gyro actually reports rotation — on devices where
     // the gyro yaw rate is unavailable at rest, |ω|≈0 and the mag keeps full
     // authority for phone-rotation tracking on a table.
-    if (Math.abs(this.lastOmega) > 0.05) return;
+    // Exception: when the device is truly at rest AND GPS-confirmed stationary
+    // (v < 0.5 and lastGpsSpeed < 0.3, e.g. a phone turning on a table), the
+    // compass IS the sole heading reference — GPS velocity carries no heading
+    // info at v=0, and a biased/scaled gyro integrates a divergent ψ during the
+    // turn. Let the at-rest blend below pull ψ toward the compass here. The
+    // corner-entry protection still holds whenever GPS has seen recent motion
+    // (lastGpsSpeed ≥ 0.3), which is the exact crawl-corner case this guard was
+    // built for.
+    const restMag = Math.abs(this.x[I.V]) < 0.5;
+    const gpsStationary = this.lastGpsSpeed < 0.3;
+    if (Math.abs(this.lastOmega) > 0.05 && !(restMag && gpsStationary)) return;
 
     // magHeadingTrust: 1 at low speed (mag owns ψ for init and backup), → 0 at
     // speed (GPS owns live heading ψ via its velocity-direction measurement).
@@ -1909,7 +1924,7 @@ if (absOmega > EPS) {
     // At low speed GPS heading is unreliable — compass IS the heading reference.
     // Skip the innovation gate and use direct blend regardless of stillness,
     // so phone rotations at v≈0 converge immediately via compass.
-    const restMag = Math.abs(this.x[I.V]) < 0.5;
+    // (restMag is hoisted above the gyro-confirmed rotation guard)
     this._debugGateThreshDeg = 0;
     if (this.gpsInitialized && !restMag) {
       const speedFactor = Math.max(0, 1 - Math.abs(this.x[I.V]) / 1.5);
@@ -1962,10 +1977,10 @@ if (absOmega > EPS) {
 
     if (Math.abs(this.x[I.V]) < 0.5) {
       // At rest: Kalman gain is near zero (P[PSI]≈0 from low gyro noise). Blend directly.
-      // Adaptive blend: small innovations → 50% (smooth), large innovations → 90% (fast catch-up).
+      // Adaptive blend: small innovations → 50% (smooth), large innovations → 100% (fast catch-up).
       // During rapid rotation at 2Hz compass rate, fixed 50% creates ~45° steady-state lag.
-      // At α=0.9 the lag drops to ~5° while convergence after rotation stops is still <1.5s.
-      const alpha = 0.5 + 0.4 * Math.min(Math.abs(innov), 1);
+      // At α=1.0 the lag drops to ~0° while convergence after rotation stops is still <1.5s.
+      const alpha = 0.5 + 0.5 * Math.min(Math.abs(innov), 1);
       this._debugMagAlpha = alpha;
       this.x[I.PSI] = this.wrapAngle(this.x[I.PSI] + innov * alpha);
     } else {
