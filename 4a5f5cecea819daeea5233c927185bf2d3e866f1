@@ -1,0 +1,36 @@
+Phase 2 Task 3: Unify GPS stationaryWeight onto motionStillness.
+
+Red (baseline guards): two tests written and run against the OLD inline
+ramp — both passed (guards, not discriminators; the plan scopes this task
+as no-regression at rest-exit and cruise):
+- 'should zero-blend GPS velocity at rest and restore it after rest-exit
+  (unified stationaryWeight)': at rest (motionStillness = 1) a sub-floor
+  spurious GPS Doppler (+0.5 m/s, below GPS_REST_NOISE = 1.0) must not be
+  adopted (v < 0.5) and ms > 0.9; after green-light ramp to 5 m/s the
+  velocity returns at full weight (v > 3.5). NOTE: first draft used a
+  consistent +2 m/s bias which FAILED because lastGpsSpeed = 2 legitimately
+  reads as motion via the hybrid-speed EMA — a real red-light residual sits
+  below the rest-noise floor, so the premise was corrected to 0.5 m/s.
+- 'should use GPS velocity at full weight at cruise': mounted 8 m/s cruise,
+  ms < 0.1, v > 7.5.
+
+Green: updateGps() now computes stationaryWeight = this.motionStillness
+instead of the inline (threshold - smoothedSpeed)/threshold ramp, and the
+updateMotionStillness() call moved BEFORE the blend (was after the block;
+the metric is fed by the same smoothedSpeed EMA, so value is identical).
+Removed the duplicate updateMotionStillness() call at the old site.
+
+Behavioral change: the ramp location shifts from [0,1] m/s (inline) to
+[1,2] m/s (ms = 1 - max(0, smoothedSpeed - GPS_REST_NOISE)) — at/below 1
+m/s the velocity is now fully zero-blended and velR capped at 5x; the
+transition happens over 1-2 m/s. Bounded impact because ZUPT (also gated
+on ms) dominates <= ~1.85 m/s. Heading cross-row decoupling
+S[PSI][X/Y/V] *= (1-w) now tracks ms identically.
+
+Transient note: on the FIRST GPS fix after a gap while this.coasting is
+still true, the metric takes the stale branch (filter v + forward proxy)
+so sw may differ from the old smoothedSpeed value for that one fix; the
+coast-recovery resetFromGps path self-corrects if the gate fails.
+
+Full suite: 89 tests pass (80 sr-ekf + 9 qr-verification), npx tsc BUILD_OK.
+Working tree clean after commit.
