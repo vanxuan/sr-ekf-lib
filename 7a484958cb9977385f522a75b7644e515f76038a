@@ -1,0 +1,17 @@
+Phase 1 Verification Report (motion_stillness_20260806)
+
+Automated test command: CI=true npm test -> 82 passed (73 tests/sr-ekf.test.ts + 9 tests/qr-verification.test.ts), 2 files, 0 failures.
+Build: npm run build (tsc) -> clean, exit 0.
+
+Manual verification (user-confirmed 'Yes, confirm Phase 1'):
+1. Full suite CI=true npm test -> 82 passed.
+2. npm run build -> clean.
+3. Metric demo spec tests/manual-verify-motion-stillness.test.ts (temp, removed after): all 3 passed with:
+   - cruise ms=0.000 stationary=false (GPS 10 m/s cruise not stationary)
+   - stop   ms=1.000 stationary=true (decel to stop is stationary)
+   - coast  ms=0.000 coasting=true (GPS lost at speed -> still moving)
+   - nogps  ms=1.000 stationary=true (device still, no GPS -> proxy stationary)
+
+Scope (since setup commit 9bfc8e4): feat commit 2e35848 (metric + diagnostics), plan commit 03c3b7c, checkpoint 7a48495.
+Code files changed in phase: src/sr-ekf.ts (covered by tests/sr-ekf.test.ts, +4 new tests), tests/sr-ekf.test.ts.
+Coverage: motionStillness paths exercised by 4 new regression tests plus existing stationary tests.
