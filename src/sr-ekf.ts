@@ -720,6 +720,34 @@ export class SrEkf {
     this.lastGpsSpeed = Math.sqrt(vx * vx + vy * vy);
     const maxPlausibleSpeed = Math.max(Math.abs(this.x[I.V]) * 2, 1.0) + 2;
     const dxGps = x - this.x[I.X], dyGps = y - this.x[I.Y];
+
+    // Rest-exit heading re-snap. During a long standstill ZUPT dragged filter v
+    // toward 0, so on the first motion fixes the GPS velocity innovation cannot
+    // rotate ψ: H[2:3][PSI/BETA] ∝ v ≈ 0 and the stationary decoupling
+    // (S[PSI][X/Y/V]→0) has not re-coupled yet. A misaligned compass — which owns
+    // ψ at rest — would otherwise keep heading pinned to the wrong bearing for
+    // many seconds until position cross-covariance slowly rebuilds (the reported
+    // "heading stuck after standing still" symptom). When GPS confirms genuine
+    // motion (speed > 2.5 m/s, direction std ≈ velR/spd ≤ 0.2 rad) while the
+    // filter still reads near-stopped (|v| < 0.5), the device is not rotating
+    // (|lastOmega| < 0.1 — excludes low-speed parking turns where gyro heading is
+    // authoritative), the fix is consistent with the car having started from here
+    // (gap < 20 m), and the GPS direction disagrees with the compass heading by
+    // >15° (genuine contradiction, not GPS noise), re-derive ψ from the GPS
+    // velocity direction and inflate heading covariance so GPS can refine it.
+    if (!this.coasting &&
+        Math.abs(this.x[I.V]) < 0.5 &&
+        this.lastGpsSpeed > 2.5 &&
+        Math.abs(this.lastOmega) < 0.1 &&
+        dxGps * dxGps + dyGps * dyGps < 400) {
+      const gpsPsi = Math.atan2(vy, vx);
+      if (Math.abs(this.wrapAngle(gpsPsi - this.x[I.PSI])) > 0.26) {
+        this.x[I.PSI] = this.wrapAngle(gpsPsi);
+        this.x[I.BETA] = 0;
+        this.S[I.PSI][I.PSI] = Math.max(this.S[I.PSI][I.PSI], Math.min(velR / this.lastGpsSpeed, 0.5));
+      }
+    }
+
     const psiBeta = this.x[I.PSI] + this.x[I.BETA];
     const cp = Math.cos(psiBeta), sp = Math.sin(psiBeta);
     const forward = dxGps * cp + dyGps * sp;    // along-track
@@ -1484,7 +1512,14 @@ if (absOmega > EPS) {
     // NOTE: the GPS-velocity heading gain MUST remain non-trivial at low speed
     // (e.g. v=1 m/s) — it is the signal that lets magnetic-declination calibrate
     // (the mag-vs-GPS-velocity heading disagreement is absorbed into magDeclination).
-    let headingGain = v < 0.2 ? 0 : Math.min((v - 0.2 + this.gyroEnergy * 0.5 + this.stepEnergy * 1.5 + this.smoothAngAccel * 0.5) / 2.8, 1);
+    // The ramp keys on the GPS-confirmed speed (max of filter v and lastGpsSpeed),
+    // NOT just filter v: after a long standstill ZUPT has dragged v toward 0, so
+    // filter v lags the true speed for seconds at start-of-motion — keying the gain
+    // on filter v alone would zero the velocity-direction columns (v<0.2) during
+    // exactly the window when a misaligned compass (which owned ψ at rest) needs
+    // to be overridden, leaving heading stuck until GPS position re-learns it.
+    const gainSpeed = Math.max(Math.abs(v), this.lastGpsSpeed);
+    let headingGain = gainSpeed < 0.2 ? 0 : Math.min((gainSpeed - 0.2 + this.gyroEnergy * 0.5 + this.stepEnergy * 1.5 + this.smoothAngAccel * 0.5) / 2.8, 1);
 
     // Adaptive initialization boost: during first 30s after GPS init, if heading
     // variance is high, temporarily boost GPS correction to accelerate convergence.
@@ -1567,7 +1602,11 @@ if (absOmega > EPS) {
     // continues to correct heading at these speeds (magHeadingTrust > 0 for
     // v<1.5), creating a clean handoff: mag owns heading at rest, GPS velocity
     // direction owns heading at speed, with smooth transition between them.
-    if (this.accelEnergy + this.gyroEnergy < 0.05) {
+    // The block is disabled whenever GPS confirms motion (lastGpsSpeed ≥ 0.3) —
+    // otherwise a start-of-motion fix would be blocked because filter v is still
+    // ~0 (ZUPT-held) and IMU energy is momentarily low, freezing heading at the
+    // misaligned rest bearing.
+    if (this.accelEnergy + this.gyroEnergy < 0.05 && this.lastGpsSpeed < 0.3) {
       const restW = Math.max(0, Math.min((1.5 - Math.abs(this.x[I.V])) / 1.0, 1));
       this.tmpH[2][I.PSI] *= (1 - restW); this.tmpH[2][I.BETA] *= (1 - restW);
       this.tmpH[3][I.PSI] *= (1 - restW); this.tmpH[3][I.BETA] *= (1 - restW);
@@ -1880,7 +1919,18 @@ if (absOmega > EPS) {
     // calibration then happens at rest/low-speed.
     let magHeadingTrust = 1;
     if (this.gpsInitialized) {
-      magHeadingTrust = Math.max(0, 1 - Math.abs(this.x[I.V]) / 1.5);
+      // The authority handoff must key on the GPS-confirmed speed, not just the
+      // filter's own v. After a long standstill, ZUPT has dragged v toward 0, so
+      // at start-of-motion EKF v lags the true speed for seconds — a misaligned
+      // compass would otherwise keep ψ pinned to the wrong bearing through the
+      // whole 0→1.5 m/s window (the reported "heading stuck after standing still,
+      // fixed only once GPS re-acquired" symptom). lastGpsSpeed is the measured
+      // GPS speed (decaying with a 2s time constant during coasting), so once
+      // GPS confirms real motion the compass cedes ψ to the GPS velocity
+      // direction immediately. The mag keeps full authority whenever GPS has not
+      // confirmed motion (lastGpsSpeed ≈ 0, e.g. phone on a table, tunnel stop).
+      const magSpeed = Math.max(Math.abs(this.x[I.V]), this.lastGpsSpeed);
+      magHeadingTrust = Math.max(0, 1 - magSpeed / 1.5);
     }
     this._debugMagTrust = magHeadingTrust;
     // GPS owns heading → skip the mag correction AND the init snap (keeps

@@ -1373,6 +1373,58 @@ describe('SrEkf', () => {
     expect(worstStale).toBeLessThan(5)
   })
 
+  it('should recover heading promptly when motion starts after a standstill with a misaligned compass', () => {
+    // Regression: during a long standstill ZUPT drags filter v toward 0 and the
+    // misaligned compass (which owns ψ at rest) pins heading to the wrong bearing.
+    // On start-of-motion, filter v lags the true speed for seconds, so the GPS
+    // velocity-direction innovation cannot rotate ψ (H[PSI] ∝ v ≈ 0) and the
+    // stationary decoupling (S[PSI][X/Y/V]→0) has not re-coupled — heading stayed
+    // stuck at the compass bearing until GPS position cross-covariance slowly
+    // rebuilt (the reported "heading stuck after standing still" symptom). The
+    // filter must re-derive ψ from the GPS velocity direction as soon as GPS
+    // confirms genuine motion instead of waiting for the lagging filter v.
+    const ekf = new SrEkf({ measurementNoise: { position: 3.0, velocity: 0.5, heading: 0.1 } })
+    ekf.reset(0, 0, 0, 0)
+    const dt = 0.02
+    const COMPASS_OFFSET = 20 * Math.PI / 180
+    const gbias = 0.02, abias = 0.03
+    // Phase 1: stationary 10s with a misaligned compass holding ψ at +20°.
+    let t = 0
+    for (; t < 10; t += dt) {
+      const ts = Math.round(t * 1000)
+      ekf.predict(abias, 0, gbias, dt, ts)
+      ekf.updateMag(0 + COMPASS_OFFSET, ts)
+      if (ts % 1000 < dt * 1000) ekf.updateGps(0, 0, 0, 0, ts)
+    }
+    expect(Math.abs((ekf.getState().psi - COMPASS_OFFSET + 3 * Math.PI) % (2 * Math.PI) - Math.PI)).toBeLessThan(0.05)
+    // Phase 2: accelerate 0 → 5 m/s east over 4s, then cruise. GPS at 1 Hz.
+    const getV = (t2: number) => (t2 < 14 ? 5 * (t2 - 10) / 4 : 5)
+    const getA = (t2: number) => (t2 > 10 && t2 <= 14 ? 5 / 4 : 0)
+    let trueX = 0
+    let lastGps = 0
+    let headErrAt14 = Infinity
+    for (; t < 20; t += dt) {
+      const ts = Math.round(t * 1000)
+      const v = getV(t), a = getA(t)
+      trueX += v * dt
+      ekf.predict(a + abias, 0, gbias, dt, ts)
+      ekf.updateMag(0 + COMPASS_OFFSET, ts)
+      if (ts - lastGps >= 1000) {
+        lastGps = ts
+        ekf.updateGps(trueX, 0, v, 0, ts)
+      }
+      if (Math.abs(t - 14) < 0.01) {
+        headErrAt14 = Math.abs((ekf.getState().psi + 3 * Math.PI) % (2 * Math.PI) - Math.PI)
+      }
+    }
+    const finalErr = Math.abs((ekf.getState().psi + 3 * Math.PI) % (2 * Math.PI) - Math.PI)
+    // Heading must be back to true (0°) by t=14 (4s after motion starts) — the
+    // rest-exit re-snap fires as soon as GPS confirms genuine motion — not stuck
+    // at the 20° compass bearing through the whole acceleration ramp.
+    expect(headErrAt14 * 180 / Math.PI).toBeLessThan(5)
+    expect(finalErr * 180 / Math.PI).toBeLessThan(2)
+  })
+
   it('should track a genuine table rotation via gyro and re-anchor to the compass after it stops', () => {
     // Guard for the gyro-confirmed rotation guard: while |ω| > 0.05 the mag
     // update is skipped, so a real rest rotation (mag bearing rotating in step

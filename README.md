@@ -193,7 +193,7 @@ new SrEkf({
 ## Validation
 
 ```bash
-npm test                 # 77 tests (9 QR verification + 68 unit)
+npm test                 # 78 tests (9 QR verification + 69 unit)
 npm run build            # TypeScript → dist/
 ```
 
