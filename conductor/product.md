@@ -6,7 +6,7 @@ Production-grade Square-Root Extended Kalman Filter for real-time IMU + GPS sens
 
 ## Product Vision
 
-`sr-ekf` is a single-file, zero-runtime-dependency TypeScript library that turns noisy, low-rate GPS plus high-rate IMU (accelerometer/gyroscope) into a smooth, accurate, drift-resistant navigation solution on resource-constrained mobile devices. It is designed to be embedded directly into applications — no build step, no dependencies, no server.
+`sr-ekf` is a modular zero-runtime-dependency TypeScript library (single entry point `sr-ekf.ts`) that turns noisy, low-rate GPS plus high-rate IMU (accelerometer/gyroscope) into a smooth, accurate, drift-resistant navigation solution on resource-constrained mobile devices. It is designed to be embedded directly into applications — no build step, no dependencies, no server.
 
 ## Target Audience
 
@@ -19,7 +19,7 @@ Production-grade Square-Root Extended Kalman Filter for real-time IMU + GPS sens
 - **Drift-resistant dead reckoning:** IMU prediction with on-line bias compensation (accelerometer, gyroscope) sustains accurate position/heading during GPS outages.
 - **Robust GPS fusion:** Mahalanobis-gated updates, direction-aware outlier rejection, robust M-estimation, and anisotropic noise models keep the filter stable in urban multipath environments.
 - **Sensor-rich heading:** Magnetometer heading with auto-calibrating magnetic declination as an EKF state; GPS velocity direction authority at speed.
-- **Zero-dependency, single-file:** `npm install`, import, use. Fully deterministic — no clock reads, all timestamps explicit.
+- **Zero-dependency, modular:** `npm install`, import, use. Internally organized by concern (math, config, CTRA, diagnostics). Fully deterministic — no clock reads, all timestamps explicit.
 
 ## Key Features & Capabilities
 

@@ -7,7 +7,7 @@
 
 ## Dependencies
 
-- **Runtime dependencies: none.** `sr-ekf` is a single-file, zero-runtime-dependency library (only `src/sr-ekf.ts` is shipped as the implementation).
+- **Runtime dependencies: none.** `sr-ekf` is a modular zero-runtime-dependency library (`src/sr-ekf.ts` entry point + concern-separated modules under `src/`). No runtime dependencies in any module.
 - **Dev dependencies:** `typescript` (build) and `vitest` (testing) only.
 
 ## Build
