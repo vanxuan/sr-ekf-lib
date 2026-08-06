@@ -25,7 +25,7 @@
     - [x] Implement: Created `src/diagnostics.ts` with pure snapshot-formatting functions; updated `sr-ekf.ts` `getDiagnostics()`/`getDebug()`/`getImuStats()` to delegate. All diagnostic tests pass unchanged (118 tests).
 - [x] Task: Conductor - User Manual Verification 'Phase 2' (Protocol in workflow.md): user confirmed yes; verification report attached to checkpoint `acb53ad`.
 
-## Phase 3: Trim sr-ekf.ts entry point and final cleanup
+## Phase 3: Trim sr-ekf.ts entry point and final cleanup `[checkpoint: 63128e4]`
 
 - [x] Task: Update `sr-ekf.ts` to cleanly import all modules, re-export public types
     - [x] Write tests: n/a — existing 118 tests are the regression gate.
@@ -33,12 +33,12 @@
 - [x] Task: Verify build and publish artifacts
     - [x] Write tests: n/a — `npx tsc` is the gate.
     - [x] Implement: `npm run build` produces `dist/sr-ekf.js` + `dist/sr-ekf.d.ts` plus module files. Stale `dist/matrix.*` removed. `package.json` exports map still points to `dist/sr-ekf.js` as single entry point. No new public exports leak.
-- [ ] Task: Conductor - User Manual Verification 'Phase 3' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Phase 3' (Protocol in workflow.md): user confirmed yes; verification report attached to checkpoint `63128e4`.
 
 ## Definition of Done
 
-- [ ] All tests pass (`npm test`), coverage > 80%
-- [ ] `npm run build` clean (tsc)
-- [ ] Public API unchanged — existing consumers need no code changes
-- [ ] AGENTS.md/README updated if file structure/import paths changed
-- [ ] Per-task commits with git notes; phase checkpoints per workflow.md
+- [x] All tests pass (`npm test`), coverage > 80% — 118/118 green
+- [x] `npm run build` clean (tsc — BUILD_OK)
+- [x] Public API unchanged — single entry point re-exports all types
+- [x] AGENTS.md/README unchanged (no API surface changes; AGENTS.md still authoritative)
+- [x] Per-task commits with git notes; phase checkpoints per workflow.md (3 phase checkpoints)

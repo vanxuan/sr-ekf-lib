@@ -9,5 +9,5 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-- [~] **Track: Restructure code — remove 1-file rule, split into modules by concern, keep sr-ekf.ts entry point, keep zero dependencies**
-  *Link: [./tracks/code_restructure_20260806/](./tracks/code_restructure_20260806/)*
+- [x] **Track: Restructure code — remove 1-file rule, split into modules by concern, keep sr-ekf.ts entry point, keep zero dependencies**
+  *Link: [./tracks/code_restructure_20260806/](./tracks/code_restructure_20260806/)* — complete (3 phases, 9 tasks, 13 commits, 118 tests, 3 checkpoints)
