@@ -586,6 +586,63 @@ describe('SrEkf', () => {
     expect(ekf.getDiagnostics().stationary).toBe(true)
   })
 
+  it('should damp a hand-held tunnel stop to zero during coasting (stale accel bias, vertical tremor)', () => {
+    // Car stopped in a tunnel with GPS lost. The device has high VERTICAL
+    // tremor variance (device stillness ≈ 0) — window is hot from the red-light
+    // phase, so it is still hot when GPS drops. The accel-bias estimate is
+    // stale/wrong (aBiasX = −0.8 → the filter integrates a phantom +0.8 m/s²
+    // forward accel, the "car shoots forward" symptom). The coasting damping
+    // must key on the VELOCITY-domain motionStillness — the stale-branch device
+    // proxy keys on the FORWARD axis (vertical bobble is ambiguous) — so ZUPT
+    // engages directly at the stop (ms ≈ 1) and holds v = 0 while the bias is
+    // re-learned. With the old 3D proxy ms ≈ 0.09 (ZUPT off), the filter relied
+    // on the transient window where the old energy gate re-learned the bias
+    // before |a_forward| could elevate accelEnergy — fragile, and it fails the
+    // moment the drive outruns the gate lag. This test pins the required
+    // behavior: a hand-held stop in a tunnel must never shoot forward.
+    const ekf = new SrEkf({ processNoise: { accelBias: 1e-4 } })
+    ekf.reset(0, 0, 0, 0)
+    ekf.updateGps(0, 0, 0, 0, 0) // GPS init at rest (speed 0)
+    let rnd = 4242
+    const rnd01 = () => { rnd = (rnd * 1103515245 + 12345) & 0x7fffffff; return rnd / 0x7fffffff }
+    for (let i = 1; i <= 60; i++) {
+      const jitter = (rnd01() + rnd01() + rnd01() + rnd01() - 2) / 2 * 1.6 // ±1.6 m/s² vertical
+      ekf.predict(0, 0, 0, 0.02, i, jitter)
+      ekf.updateGps(0, 0, 0, 0, i) // hold at rest, keep device-variance window hot
+    }
+    expect(ekf.getStillness()).toBeLessThan(0.15) // device variance window is already hot
+    expect(ekf.coast(5000, 6000)).toBe(true)      // GPS lost while stopped (tunnel)
+    ekf.resetBiases(-0.8, 0)                      // stale wrong bias → a_forward = +0.8
+    for (let i = 601; i <= 1600; i++) {
+      const jitter = (rnd01() + rnd01() + rnd01() + rnd01() - 2) / 2 * 1.6
+      ekf.predict(0, 0, 0, 0.01, i, jitter)
+    }
+    const s = ekf.getState()
+    expect(ekf.getStillness()).toBeLessThan(0.15) // device is definitely not still
+    expect(s.v).toBeLessThan(0.2)                 // velocity held/damped to zero
+    expect(s.aBiasX).toBeGreaterThan(-0.8 + 0.3)  // bias re-learned toward 0 (drive removed)
+  })
+
+  it('should preserve genuine motion during coasting (motionStillness low)', () => {
+    // Mounted cruise in a tunnel: device-still, GPS-confirmed 8 m/s, filter v
+    // tracking it. motionStillness is LOW so neither ZUPT nor the coasting
+    // velocity damping may drag v toward zero — the coasting velocity prior
+    // holds it at coastSpeed. The old `accelEnergy + gyroEnergy < 0.1` gate
+    // fired on a smooth cruise (zero IMU energy) and killed the velocity.
+    const ekf = new SrEkf()
+    ekf.reset(0, 0, 8, 0)
+    ekf.updateGps(0, 0, 8, 0, 0) // GPS init cruising at 8 m/s
+    for (let i = 1; i <= 60; i++) {
+      ekf.predict(0, 0, 0, 0.02, i)
+      ekf.updateGps(0, 8 * 0.02 * i, 8, 0, i)
+    }
+    expect(ekf.coast(5000, 6000)).toBe(true)
+    for (let i = 601; i <= 1200; i++) ekf.predict(0, 0, 0, 0.02, i) // 12s tunnel cruise
+    const d = ekf.getDiagnostics()
+    expect(d.motionStillness).toBeLessThan(0.2) // filter v ≈ coastSpeed keeps it low
+    expect(ekf.getState().v).toBeGreaterThan(7) // velocity NOT damped to zero
+  })
+
   it('should converge heading from magnetometer updates', () => {
     const ekf = new SrEkf({ measurementNoise: { heading: 0.1 } })
     ekf.reset(0, 0, 5, Math.PI)

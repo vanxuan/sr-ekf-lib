@@ -87,6 +87,13 @@ const DEVICE_GYRO_SCALE = 0.5;
 // for). Real walking / a green-light start excite the forward axis and so pass
 // the gate immediately.
 const DEVICE_ACTIVITY_FLOOR = 0.01;
+// Coasting velocity-damping engagement: the smooth v≈0 damping fires only while
+// motionStillness reads "vehicle stopped" (velocity evidence near zero). 0.5
+// corresponds to a stale filter v ≈ 4.5 m/s with a quiet device proxy — loose
+// enough to catch a stop whose stale v is still a few m/s, high enough to leave
+// a genuine 5+ m/s tunnel crawl to the coasting velocity prior (whose hold is
+// validated by the 'preserve genuine motion during coasting' test).
+const COAST_DAMP_STILL = 0.5;
 
 import { matCreate, matLowerToFull, matLowerToFullInto, chol4x4, cholSolve4, ensureDiag } from './matrix';
 
@@ -567,16 +574,20 @@ export class SrEkf {
       si[I.Y][I.Y] = Math.max(si[I.Y][I.Y], 3);
       si[I.PSI][I.PSI] = Math.max(si[I.PSI][I.PSI], 0.3);
     }
-    // Velocity damping during coasting: when GPS is lost and the car appears
-    // stationary (low IMU energy), inject a soft pseudo-measurement v ≈ 0 via
-    // scalar QR.  This prevents the "car icon shoots forward" symptom — without
-    // GPS, uncorrected accel bias integrates into velocity and position.  The
-    // measurement noise tightens over time (loose initially, tight after 30s) so
-    // genuine motion is preserved but stopped cars converge to v = 0.
+    // Velocity damping during coasting: when GPS is lost and the VEHICLE is
+    // stopped (motionStillness high — the velocity-domain metric, driven by
+    // filter v and the forward-axis device proxy, NOT raw IMU energy), inject
+    // a soft pseudo-measurement v ≈ 0 via scalar QR. This prevents the "car
+    // icon shoots forward" symptom — without GPS, uncorrected accel bias
+    // integrates into velocity and position. Keying on motionStillness instead
+    // of `accelEnergy + gyroEnergy < 0.1` keeps a smooth mounted cruise (zero
+    // IMU energy but motionStillness low) at coastSpeed, and lets a hand-held
+    // stop (vertical tremor doesn't read as velocity evidence) converge to 0.
+    // The measurement noise tightens over time (loose initially, tight after
+    // 30s) so genuine motion is preserved but stopped cars converge to v = 0.
     if (this.coasting && !this._zuptEngaged) {
       const coastTimeS = Math.max(0, (this.lastImuTimeMs - this.lastGpsTimeMs)) / 1000;
-      const stationarity = this.accelEnergy + this.gyroEnergy;
-      if (coastTimeS > 3 && stationarity < 0.1 && Math.abs(this.x[I.V]) > 0.05) {
+      if (coastTimeS > 3 && this.motionStillness > COAST_DAMP_STILL && Math.abs(this.x[I.V]) > 0.05) {
         const rDamp = Math.max(0.05, 10.0 / Math.max(coastTimeS, 1));
         const innov = -this.x[I.V];
         const SV = this.S[I.V];
@@ -615,7 +626,12 @@ export class SrEkf {
       if (stationarity > 0.05 || Math.abs(this.x[I.V]) > 0.5) {
         // Prior R grows with coast time: tight at onset (R=2), loose after 30s (R≈20)
         const rPrior = Math.min(2.0 + coastTimeS * 0.6, 20.0);
-        const innov = this.x[I.V] - this.coastSpeed;
+        // Innovation is z − h = coastSpeed − v (measurement z is the captured
+        // speed at GPS loss). Using v − coastSpeed here would push v AWAY from
+        // coastSpeed: a bias-driven overspeed is amplified, and an underspeed
+        // decays into a positive-feedback runaway (v collapses to 0 while
+        // aBiasX grows) over long tunnel cruises.
+        const innov = this.coastSpeed - this.x[I.V];
         const SV = this.S[I.V];
         let sInnov = rPrior * rPrior;
         for (let j = 0; j < N; j++) sInnov += SV[j] * SV[j];
@@ -1442,8 +1458,8 @@ if (absOmega > EPS) {
     // velocity rest-noise floor — a real stop reports GPS jitter, which must
     // not read as motion. GPS stale (coasting): fall back to filter v (scaled
     // by MOTION_V_CUT_STALE so a device-still corrupted v up to ~6 m/s still
-    // reads as still and ZUPT can recover it), then to device stillness as a
-    // one-way proxy (a still device suggests a stopped vehicle; a jiggly
+    // reads as still and ZUPT can recover it), then to a FORWARD-axis device-
+    // stillness proxy (a still device suggests a stopped vehicle; a jiggly
     // device is ambiguous and does not force motion).
     // In BOTH branches, device-motion evidence adds to the velocity evidence.
     // It is bias-INVARIANT: it uses raw forward-axis window variance (a tilted
@@ -1463,8 +1479,12 @@ if (absOmega > EPS) {
     if (!this.coasting && this.smoothedSpeed !== undefined) {
       speedEvidence = Math.max(0, this.smoothedSpeed - GPS_REST_NOISE);
     } else {
-      const deviceStillness = this.getStillness();
-      speedEvidence = Math.max(Math.abs(this.x[I.V]) / MOTION_V_CUT_STALE, 1 - deviceStillness);
+      // The stale proxy keys on the FORWARD axis only. A 3D proxy would read a
+      // hand-held tunnel stop (mostly vertical tremor) as moving, pushing
+      // motionStillness to ~0 and blocking ZUPT + the coasting velocity damping
+      // — the "car icon shoots forward" symptom while the vehicle is stopped.
+      const fwdStillness = Math.exp(-(this._varAx + this._varAy) / (0.3 * 0.3));
+      speedEvidence = Math.max(Math.abs(this.x[I.V]) / MOTION_V_CUT_STALE, 1 - fwdStillness);
     }
     this.motionStillness = Math.min(Math.max(1 - Math.max(speedEvidence, deviceMotion), 0), 1);
   }
