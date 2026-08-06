@@ -5,6 +5,7 @@ import { N, M, PRE, MAG_PRE, NTRI, I, DEFAULTS, EPS, MOTION_V_CUT, GPS_REST_NOIS
 import { matCreate, matLowerToFull, matLowerToFullInto, chol4x4, cholSolve4, ensureDiag, qrInPlace, wrapAngle, copySfromQR } from './math';
 
 import { RingBuf } from './ring-buf';
+import { ctraDelta, computeJacobian } from './ctra';
 
 export class SrEkf {
   private readonly x = new Float64Array(N);
@@ -372,7 +373,7 @@ export class SrEkf {
       : Math.max(0.5, 1.5 - (absV - 1.5) * (1.0 / 3.5));
     const betaTau = betaTauBase * (1 - 0.6 * angAccelNorm) * (1 - 0.5 * this.stepEnergy);
     const expDt50 = Math.exp(-dt / 50);
-    this.computeJacobian(a, omegaAvg, dt, betaTau, this.accelEnergy < 0.05 ? expDt50 : 1);
+    computeJacobian(this.x[I.PSI] + this.x[I.BETA], this.x[I.V], a, omegaAvg, dt, betaTau, this.accelEnergy < 0.05 ? expDt50 : 1, EPS, this.tmpF);
 
     for (let i = 0; i < N; i++)
       for (let j = 0; j < N; j++) {
@@ -393,9 +394,8 @@ export class SrEkf {
 
     this.copySfromQR(this.tmpQR, 0);
 
-    const psiBeta = psi + beta;
     const vAvg = v + 0.5 * a * dt;
-    const [dx, dy] = this.ctraDelta(psiBeta, vAvg, omegaAvg, dt);
+    const [dx, dy] = ctraDelta(psi + beta, vAvg, omegaAvg, dt);
     this.x[I.X] += dx;
     this.x[I.Y] += dy;
     this.x[I.V] = Math.max(0, v + a * dt);
@@ -1177,58 +1177,7 @@ export class SrEkf {
     this.curAzimuth = prevAz; this.curPitch = prevPi; this.curRoll = prevRo;
   }
 
-  // ─── CTRA kinematics ────────────────────────────────────────────
-
-  private ctraDelta(psi: number, v: number, omega: number, dt: number): [number, number] {
-    if (Math.abs(omega) > EPS) {
-      const sp = Math.sin(psi), cp = Math.cos(psi);
-      const spw = Math.sin(psi + omega * dt), cpw = Math.cos(psi + omega * dt);
-      return [v / omega * (spw - sp), v / omega * (-cpw + cp)];
-    }
-    const cp = Math.cos(psi), sp = Math.sin(psi);
-    return [v * cp * dt, v * sp * dt];
-  }
-
-  private computeJacobian(a: number, omega: number, dt: number, betaTau: number, aBiasDecay: number): void {
-    const psi = this.x[I.PSI], beta = this.x[I.BETA];
-    const psiBeta = psi + beta, v = this.x[I.V];
-    const vAvg = v + 0.5 * a * dt;
-    for (let i = 0; i < N; i++) this.tmpF[i].fill(0);
-    for (let i = 0; i < N; i++) this.tmpF[i][i] = 1;
-
-    const absOmega = Math.abs(omega);
-if (absOmega > EPS) {
-      const sp = Math.sin(psiBeta), cp = Math.cos(psiBeta);
-      const spw = Math.sin(psiBeta + omega * dt), cpw = Math.cos(psiBeta + omega * dt);
-      const o2 = omega * omega;
-      this.tmpF[I.X][I.V] = (spw - sp) / omega;
-      this.tmpF[I.X][I.PSI] = vAvg / omega * (cpw - cp);
-      this.tmpF[I.X][I.BETA] = this.tmpF[I.X][I.PSI];
-      this.tmpF[I.X][I.G_BIAS_Z] = -vAvg * ((spw - sp) / o2 - dt * cpw / omega);
-      this.tmpF[I.Y][I.V] = (-cpw + cp) / omega;
-      this.tmpF[I.Y][I.PSI] = vAvg / omega * (spw - sp);
-      this.tmpF[I.Y][I.BETA] = this.tmpF[I.Y][I.PSI];
-      this.tmpF[I.Y][I.G_BIAS_Z] = -vAvg * ((-cpw + cp) / o2 - dt * spw / omega);
-    } else {
-      const cp = Math.cos(psiBeta), sp = Math.sin(psiBeta);
-      const dt2 = dt * dt;
-      this.tmpF[I.X][I.V] = cp * dt;
-      this.tmpF[I.X][I.PSI] = -vAvg * sp * dt;
-      this.tmpF[I.X][I.BETA] = this.tmpF[I.X][I.PSI];
-      this.tmpF[I.X][I.G_BIAS_Z] = -0.5 * vAvg * sp * dt2;
-      this.tmpF[I.Y][I.V] = sp * dt;
-      this.tmpF[I.Y][I.PSI] = vAvg * cp * dt;
-      this.tmpF[I.Y][I.BETA] = this.tmpF[I.Y][I.PSI];
-      this.tmpF[I.Y][I.G_BIAS_Z] = 0.5 * vAvg * cp * dt2;
-    }
-    this.tmpF[I.X][I.A_BIAS_X] = -0.5 * dt * this.tmpF[I.X][I.V];
-    this.tmpF[I.Y][I.A_BIAS_X] = -0.5 * dt * this.tmpF[I.Y][I.V];
-    this.tmpF[I.V][I.A_BIAS_X] = -dt;
-    this.tmpF[I.PSI][I.G_BIAS_Z] = -dt;
-    this.tmpF[I.BETA][I.BETA] = Math.exp(-dt / betaTau);
-    this.tmpF[I.A_BIAS_X][I.A_BIAS_X] = aBiasDecay;
-    this.tmpF[I.MAG_DECL][I.MAG_DECL] = 1;
-  }
+  // ─── CTRA kinematics (extracted to src/ctra.ts) ────────────────
 
   // ─── Adaptive process noise ──────────────────────────────────────
 
