@@ -643,6 +643,56 @@ describe('SrEkf', () => {
     expect(ekf.getState().v).toBeGreaterThan(7) // velocity NOT damped to zero
   })
 
+  it('should zero-blend GPS velocity at rest and restore it after rest-exit (unified stationaryWeight)', () => {
+    // The GPS velocity z-blend must key on the fused motionStillness metric: at
+    // a full stop (motionStillness = 1) a consistent spurious Doppler velocity
+    // (multipath bias at a red light) is blended to zero, so v stays pinned near
+    // 0. When genuine motion resumes (GPS speed rises, motionStillness → 0) the
+    // velocity returns at full weight and v converges to the GPS speed. This is
+    // the no-regression guard for the unified stationaryWeight.
+    const ekf = new SrEkf({ measurementNoise: { position: 3.0, velocity: 0.5 } })
+    ekf.reset(0, 0, 0, 0)
+    ekf.updateGps(0, 0, 0, 0, 0) // GPS init at rest
+    // stopped at a red light: stationary position, GPS Doppler biased +0.5 m/s
+    // (a plausible multipath residual, below the GPS_REST_NOISE rest floor — a
+    // consistent +2 m/s bias would legitimately read as motion via lastGpsSpeed)
+    for (let i = 1; i <= 200; i++) {
+      ekf.predict(0, 0, 0, 0.01, i)
+      ekf.updateGps(0, 0, 0.5, 0, i)
+    }
+    let s = ekf.getState()
+    expect(ekf.getDiagnostics().motionStillness).toBeGreaterThan(0.9)
+    expect(s.v).toBeLessThan(0.5) // spurious velocity must not be adopted at rest
+    // green light: accelerate to 5 m/s (GPS velocity now genuine)
+    let py = 0, spd = 0
+    for (let i = 201; i <= 320; i++) {
+      spd = Math.min(5, spd + 0.5)
+      py += spd * 0.01
+      ekf.predict(0, 0, 0, 0.01, i)
+      ekf.updateGps(0, py, spd, 0, i)
+    }
+    s = ekf.getState()
+    expect(ekf.getDiagnostics().motionStillness).toBeLessThan(0.3)
+    expect(s.v).toBeGreaterThan(3.5) // velocity adopted after rest-exit
+  })
+
+  it('should use GPS velocity at full weight at cruise (stationaryWeight ≈ 0 when motionStillness low)', () => {
+    // Mounted cruise: motionStillness ≈ 0 → stationaryWeight ≈ 0 → the GPS
+    // velocity is used at full weight (no z-blend, no stationary velR inflation).
+    // v must converge to the GPS speed — the no-regression guard for the
+    // unified stationaryWeight at the cruise endpoint of the ramp.
+    const ekf = new SrEkf({ measurementNoise: { position: 3.0, velocity: 0.5 } })
+    ekf.reset(0, 0, 8, 0)
+    ekf.updateGps(0, 0, 8, 0, 0) // GPS init cruising at 8 m/s
+    for (let i = 1; i <= 100; i++) {
+      ekf.predict(0, 0, 0, 0.01, i)
+      ekf.updateGps(0, 8 * 0.01 * i, 8, 0, i)
+    }
+    const d = ekf.getDiagnostics()
+    expect(d.motionStillness).toBeLessThan(0.1)
+    expect(ekf.getState().v).toBeGreaterThan(7.5)
+  })
+
   it('should converge heading from magnetometer updates', () => {
     const ekf = new SrEkf({ measurementNoise: { heading: 0.1 } })
     ekf.reset(0, 0, 5, Math.PI)

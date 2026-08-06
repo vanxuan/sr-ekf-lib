@@ -839,17 +839,21 @@ export class SrEkf {
     // Hybrid speed: GPS primary, 30 % of EKF v as fallback against GPS glitches
     // at sustained speed (GPS speed can briefly read near zero during an RF
     // dropout while the vehicle is still doing 5+ m/s).
-    // Smoothed with a 3 s exponential moving average so stationaryWeight doesn't
-    // oscillate in stop-and-go traffic.
+    // Smoothed with a 3 s exponential moving average so the shared motionStillness
+    // metric (and this blend) doesn't oscillate in stop-and-go traffic.
     if (this.smoothedSpeed === undefined) this.smoothedSpeed = this.lastGpsSpeed;
     const ekfSpeed = Math.abs(this.x[I.V]);
     const hybridSpeed = Math.max(this.lastGpsSpeed, ekfSpeed * 0.3);
     this.smoothedSpeed = 0.7 * this.smoothedSpeed + 0.3 * hybridSpeed;
-    // Transition zone 0–1.0 m/s (was 0–0.5): GPS course error at 0.5 m/s is
-    // still ~30° (3 m accuracy) — keeping more compass influence during the
-    // critical early-acceleration phase.
-    const threshold = 1.0;
-    const stationaryWeight = Math.max(0, (threshold - this.smoothedSpeed) / threshold);
+    // Unify the stationary weight onto the shared motionStillness metric (the
+    // velocity-domain truth, computed from the same smoothedSpeed EMA above):
+    // at a full stop ms = 1 → GPS velocity zero-blended and velR inflated to the
+    // cap; at cruise ms = 0 → velocity used at full weight. Previously this was
+    // a second inline `(threshold − smoothedSpeed)/threshold` ramp (linear 0→1
+    // over 0–1 m/s) that could drift out of sync with the ZUPT / coasting-damping
+    // view of "stopped" — one metric, one truth.
+    this.updateMotionStillness();
+    const stationaryWeight = this.motionStillness;
     this.tmpZ[2] = vx * (1 - stationaryWeight);
     this.tmpZ[3] = vy * (1 - stationaryWeight);
     // Cap inflation at 5× (was 10×) so the Kalman gains don't drop below ~16 %
@@ -865,8 +869,6 @@ export class SrEkf {
     this.S[I.PSI][I.X] *= (1 - w);
     this.S[I.PSI][I.Y] *= (1 - w);
     this.S[I.PSI][I.V] *= (1 - w);
-
-    this.updateMotionStillness();
 
     const ok = this.gpsUpdateSingle(posR, velR);
     let result = ok;
