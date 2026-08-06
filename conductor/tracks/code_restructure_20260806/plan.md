@@ -7,9 +7,9 @@
 - [x] Task: Extract matrix/QR math into `src/math.ts`
     - [x] Write tests: `tests/math.test.ts` — 6 unit tests for `qrInPlace`, `wrapAngle`, `ensureDiag`, `chol4x4`+`cholSolve4`, `matLowerToFull`, `traceOfP`.
     - [x] Implement: Created `src/math.ts` consolidating all functions from `src/matrix.ts` + `qrInPlace`, `wrapAngle`, `copySfromQR` from `sr-ekf.ts`. Updated import in `sr-ekf.ts`; replaced private method bodies with thin wrappers. Deleted `src/matrix.ts`. `qr-verification.test.ts` and full suite pass unchanged (96 tests).
-- [ ] Task: Extract RingBuf into `src/ring-buf.ts`
-    - [ ] Write tests: `tests/ring-buf.test.ts` — push, shift, get, length, wrap-around behavior, empty-buffer edge cases.
-    - [ ] Implement: Create `src/ring-buf.ts` with `RingBuf` class; import in `sr-ekf.ts`; remove inline definition. All window-dependent tests pass unchanged.
+- [x] Task: Extract RingBuf into `src/ring-buf.ts`
+    - [x] Write tests: `tests/ring-buf.test.ts` — 7 unit tests for push, shift, get, wrap-around, clear, capacity.
+    - [x] Implement: Created `src/ring-buf.ts` with `RingBuf` class; imported in `sr-ekf.ts`; removed inline definition. Fixed latent shift() bug (computed index before decrement). All window-dependent tests pass unchanged (103 tests).
 - [ ] Task: Extract config types, defaults, and constants into `src/config.ts`
     - [ ] Write tests: n/a (types/constants — implicitly tested by existing suite).
     - [ ] Implement: Create `src/config.ts` with `EkfConfig`, defaults, `I` index constants, module-level constants (EPS, GPS_REST_NOISE, etc.); import in `sr-ekf.ts`.
