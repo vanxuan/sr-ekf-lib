@@ -119,7 +119,8 @@ interface EkfDiagnostics {
   coasting: boolean;         // true during GPS outage
   lastGpsTimeMs: number;
   lastImuTimeMs: number;
-  stationary: boolean;       // stillness > 0.7 AND |v| < 3
+  stationary: boolean;       // motionStillness > 0.7 AND |v| < 3
+  motionStillness: number;   // fused metric (0=moving, 1=stopped)
   magDeclination: number;
   robustWeight: number;      // M-estimator weight (1 = no downweighting)
   adaNoiseScale: number;     // adaptive noise inflation factor
@@ -193,7 +194,7 @@ new SrEkf({
 ## Validation
 
 ```bash
-npm test                 # 78 tests (9 QR verification + 69 unit)
+npm test                 # 90 tests (9 QR verification + 81 unit)
 npm run build            # TypeScript → dist/
 ```
 

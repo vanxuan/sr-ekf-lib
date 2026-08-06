@@ -172,15 +172,51 @@ Configurable via `adaptiveScaling` (defaults tuned for handheld/wearable):
   headingGyro: 0.5, headingStep: 1.5, sideslipGyro: 0.5, sideslipStep: 1.8 }
 ```
 
+### Fused Motion Stillness (`motionStillness`)
+
+The velocity-domain consumers (ZUPT, coasting damping, GPS stationary-weight blend, stationary diagnostic) share a single fused `motionStillness ∈ [0,1]` metric that answers "is the vehicle stopped?" This is kept separate from the raw‑IMU `getStillness()` (device stillness) used by device-domain logic (mag adaptive noise, omegaScale at rest).
+
+**Formula** (compute in `predict()`/`updateGps()`):
+
+```
+motionStillness = clamp(1 − max(speedEvidence, deviceMotion), 0, 1)
+```
+
+**Fresh branch** (GPS present, `!coasting`):
+- `speedEvidence = max(0, smoothedSpeed − GPS_REST_NOISE)` where `GPS_REST_NOISE = 1.0`
+- `smoothedSpeed` = 3 s EMA of `hybridSpeed = max(lastGpsSpeed, 0.3⋅|v|)` — the GPS speed is primary; 30 % of EKF v is a fallback against RF dropouts where GPS briefly reads zero while the vehicle moves.
+- At/below 1 m/s: `speedEvidence = 0` → vehicle reads as stopped regardless of GPS velocity noise.
+- At ≥2 m/s: `speedEvidence ≥ 1` → reads as fully moving.
+
+**Stale branch** (coasting, GPS lost):
+- `speedEvidence = max(|v| / MOTION_V_CUT, 1 − fwdStillness)`, where `MOTION_V_CUT = 9.0` and
+- `fwdStillness = exp(−(varAx + varAy) / 0.3²)` — a forward-axis proxy that reads a hand-held tunnel stop (mostly vertical tremor) as still, preventing the "car shoots forward" symptom where a 3D proxy would see movement and block ZUPT.
+- A stale `v ≈ 6` still reads as still via the `|v|/9` term, letting ZUPT recover the corrupted velocity.
+
+**Device-motion evidence** (both branches):
+`deviceMotion = max(varEvidence, rawAxEvidence, gyroEvidence) × 8.0`
+- Variance-gated: constant ax (tilted mount, bias projection) → zero variance → no false device motion.
+- `rawAxEvidence` only activates when forward-axis variance exceeds `DEVICE_ACTIVITY_FLOOR` (0.01) — prevents ACC bias offset from counting as motion.
+
+**Consumer routing**:
+| Consumer | Metric | File location |
+|---|---|---|
+| ZUPT weight | `motionStillness × speedGate(|v|)` | `predict()` |
+| Coasting velocity damping | `motionStillness > COAST_DAMP_STILL` | `predict()` |
+| GPS stationary weight | `motionStillness` | `updateGps()` |
+| Diagnostics `stationary` | `motionStillness > 0.7 && \|v\| < 3.0` | `getDiagnostics()` |
+| Mag adaptive noise | `getStillness()` (raw IMU) | `magUpdateSingle()` |
+| Rest-rotation omegaScale | `getStillness()` | `predict()` heading integration |
+
 ### Zero-Velocity Update (ZUPT)
-- Stationary detection via exponential `getStillness()` metric derived from 3D IMU variance (1s time-based window, not frame-count based)
+- Stationary detection via fused `motionStillness` metric (velocity-domain), not raw IMU variance
 - Hysteresis engagement (ZUPT_ON=0.15, ZUPT_OFF=0.05) prevents toggling
 - Scalar QR update injects v=0 with 0.01 m/s noise → corrects biases through cross-covariance
-- **Smooth engagement**: ZUPT weight = `stillness × speedGate(|v|)`, where `stillness = exp(−(accel3DVar/0.09 + gyro3DEnergy/0.0025))` (1 at rest, → 0 during motion; uses 3D ax+ay+az variance and 3D gx+gy+gz energy) and `speedGate(|v|) = clamp((8.0 − |v|) / 4.0, 0, 1)` (full below 4 m/s, zero above 8 m/s). At rest, stillness ≈ 1 and speedGate ≈ 1, so ZUPT engages whenever the IMU variance is low (constant readings). A genuine (varying) acceleration has high 3D variance → stillness → 0, correctly excluding ZUPT. The speed-gate cutoff is raised to 8 m/s so ZUPT can RECOVER a corrupted/large `v` left over when the phone is placed down (e.g. a stale `v≈6 m/s`). Chi-square innovation gate (threshold 9.0 = 3σ) rejects velocity innovations inconsistent with zero-velocity hypothesis. Continuous on/off transitions; measurement noise R = 0.01 / weight so ZUPT is precise when confident, loose when uncertain.
+- **Smooth engagement**: ZUPT weight = `motionStillness × speedGate(|v|)`, where `speedGate(|v|) = clamp((8.0 − |v|) / 4.0, 0, 1)` (full below 4 m/s, zero above 8 m/s). At a stop, motionStillness ≈ 1 and speedGate ≈ 1 → ZUPT engages whenever the vehicle is stopped. Chi-square innovation gate (threshold 9.0 = 3σ) rejects velocity innovations inconsistent with zero-velocity hypothesis. Continuous on/off transitions; measurement noise R = 0.01 / weight so ZUPT is precise when confident, loose when uncertain.
 - **GPS-gated ZUPT**: when GPS is present and reports speed `> 2.0 m/s` (`lastGpsSpeed`), the device is genuinely moving, so ZUPT is suppressed even if `ax` is constant — constant acceleration cruising must integrate normally. At rest GPS speed is ~0 (or GPS absent → `lastGpsSpeed` stays 0), so ZUPT engages and learns the bias. This resolves the IMU-only ambiguity between "constant accel bias at rest" and "genuine constant acceleration".
-- **Continuous velR inflation**: Two-stage GPS velocity noise inflation. First, a speed ramp: `velR *= (1 + 2 × speedRamp)` where `speedRamp = max(0, 1 − |v|/10)` (1 at v=0, 0 at v≥10), preventing velocity jumps at moderate city speeds. Then, stationary-weight inflation: `velR *= (1 + min(4, 9 × stationaryWeight))` where `stationaryWeight = max(0, (1.0 − smoothedSpeed) / 1.0)` and `smoothedSpeed` is a 3s EMA of `max(lastGpsSpeed, |v| × 0.3)` (hybrid GPS+EKF speed). At rest (smoothedSpeed≈0), velR is inflated up to 5×; at smoothedSpeed≥1.0, no inflation. A further ×4 inflation is applied when GPS Doppler opposes the IMU heading direction at low speed (`|v| < 2.5` and dot-product < 0), distrusts multipath-corrupted velocity directions in urban canyons
+- **Continuous velR inflation**: Two-stage GPS velocity noise inflation. First, a speed ramp: `velR *= (1 + 2 × speedRamp)` where `speedRamp = max(0, 1 − |v|/10)` (1 at v=0, 0 at v≥10), preventing velocity jumps at moderate city speeds. Then, stationary-weight inflation: `velR *= (1 + min(4, 9 × stationaryWeight))` where `stationaryWeight = motionStillness` (the fused metric — at a stop ms=1 → velR ×5; at cruise ms=0 → no inflation). A further ×4 inflation is applied when GPS Doppler opposes the IMU heading direction at low speed (`|v| < 2.5` and dot-product < 0), distrusts multipath-corrupted velocity directions in urban canyons
 - **No velocity clamping**: `applyZupt()` does NOT force `v=0` — the Kalman update pulls v toward 0 naturally via `rVel = 0.01/weight`. This allows IMU acceleration to gradually build v during ZUPT, preventing the "stuck at red light" problem.
-- **Disengagement uses hysteresis**: ZUPT disengages when `gpsMoving` (GPS speed > 2.0 m/s) or `zuptWeight < ZUPT_OFF` (0.05). Since `zuptWeight = stillness × speedGate`, disengagement occurs when stillness drops (motion begins) or speed rises above the gate. On the transition, V/PSI Cholesky rows are inflated (V=1.5, X/Y=3.0, PSI=0.3) to prevent first GPS after stop from overshooting.
+- **Disengagement uses hysteresis**: ZUPT disengages when `zuptWeight < ZUPT_OFF` (0.05), which occurs when motionStillness drops (motion begins) or speed rises above the speed gate. On the transition, V/PSI Cholesky rows are inflated (V=1.5, X/Y=3.0, PSI=0.3) to prevent first GPS after stop from overshooting.
 - **`getStillness()` is variance-based ONLY**: `stillness = exp(−(accel3DVar / T_a² + gyro3DEnergy / T_w²))` where `T_a = 0.3` and `T_w = 0.05`, with `accel3DVar` = 3D (ax+ay+az) window variance and `gyro3DEnergy` = 3D (gx+gy+gz) mean energy. Returns 0.5 (neutral) when < 5 samples. A stationary device has near-zero 3D variance → stillness ≈ 1; motion drives variance up → stillness → 0. The magnitude term (`|a|/5`) is still used for adaptive process-noise scaling and `accelEnergy`-based ZUPT GPS-gating, but NOT for stillness. Note ZARU is **no longer** gated on `getStillness()` (see ZARU bullet) — it uses the filter's own `|ω|`.
 - **Heading covariance floor**: After ZUPT QR update, `S[PSI][PSI]` is clamped to ≥ 0.05 rad — prevents heading from locking up during long stops
   - **ZARU (Zero Angular Rate Update)**: A scalar QR update injects `omega = 0` with noise `R = 0.01 / zaruGate` rad/s, making gyro bias (`g_bias_z`) observable when the device is not rotating — the filter drives `gBiasZ → gz` when the true angular rate is known to be zero, preventing gyro bias drift through stop-start cycles. ZARU is a **standalone method called directly from `predict()`**, gated on the filter's own bias-corrected rate `zaruGate = 1 − min(|ω|/0.2, 1)`, firing when `zaruGate > 0.5` (i.e. `|ω| < 0.1 rad/s`) — NOT on the raw-IMU `getStillness()` and NOT nested inside ZUPT. Being standalone means ZARU runs even when GPS confirms motion and ZUPT is disabled, so gyro bias is always corrected when the device isn't rotating. Rationale: on a real phone the gyro has high *variance* even at rest, so the variance-based `stillness` saturates to 0 → an IMU-stillness-gated ZARU never fires → gyro bias stays uncorrected → ψ integrates the residual rate → the **"large circle" drift** at rest. Gating on the bias-corrected rate `|ω|` (the exact quantity ψ integrates) is noise-amplitude-independent: when the device is truly still, `|ω|` is small whenever `gBiasZ` is even roughly right, and the update then pulls `gBiasZ` the rest of the way to `gz`. A lenient 0.1 rad/s threshold lets it bootstrap from a wrong initial bias (e.g. `gBiasZ=0`, true bias 0.0583 → `|ω|≈0.0583 < 0.1` → ZARU fires → bias learned).
@@ -280,7 +316,7 @@ When GPS is lost (tunnel, parking garage, urban canyon), the filter transitions 
 - **Coasting Q reduction**: During coasting, position/velocity process noise is scaled to 30% (`COAST_Q_FACTOR = 0.3`) — without GPS corrections, bias-driven position error is already captured in P via cross-covariance; adding full Q over-inflates uncertainty. Heading/bias Q remain at full strength since ZARU/Mag still provide corrections
 - **Coast covariance cap**: Position σ capped at 500m, velocity σ at 50 m/s during coasting — prevents unbounded growth in very long tunnels (2+ minutes)
 - **Stale GPS speed decay**: `lastGpsSpeed` decays immediately (no delay) toward 0 with 2s time constant during coasting — enables ZUPT to engage within ~2 seconds if the car stops in a basement/tunnel (previously blocked for ~25s after highway-speed GPS loss)
-- **Velocity damping during coasting**: When GPS is lost for >3s and the car appears stationary (`accelEnergy + gyroEnergy < 0.1`), a scalar QR pseudo-measurement injects `v ≈ 0` with measurement noise that tightens over time (`R = max(0.05, 10/coastTimeS)`) — prevents the "car icon shoots forward" symptom where uncorrected accel bias integrates into persistent forward velocity. Genuine motion is preserved because the pseudo-measurement only fires when IMU energy is near zero
+- **Velocity damping during coasting**: When GPS is lost for >3s and the car appears stationary (`motionStillness > COAST_DAMP_STILL`, where `COAST_DAMP_STILL = 0.5`), a scalar QR pseudo-measurement injects `v ≈ 0` with measurement noise that tightens over time (`R = max(0.05, 10/coastTimeS)`) — prevents the "car icon shoots forward" symptom where uncorrected accel bias integrates into persistent forward velocity. Genuine motion is preserved because the pseudo-measurement only fires when the velocity-domain metric says stopped (the stale-branch forward-axis proxy reads a hand-held tunnel stop as still).
 - **Velocity prior during coasting**: When GPS is lost and the car is moving (not stopped), a soft scalar QR pseudo-measurement pulls `v` toward `coastSpeed` (the speed captured at GPS loss). Measurement noise grows linearly with coast time (`R = 2 + coastTimeS × 0.6`, capped at 20) — tight anchor at onset (strong velocity constraint), loose after ~30s (car may have turned/stopped). Prevents accel bias from drifting velocity during continuous-motion multi-basement driving where the car never stops long enough for ZUPT to engage. Only fires when IMU energy > 0.05 or |v| > 0.5 m/s (excludes stationary). `coastSpeed` is captured once when coasting begins and reset when GPS re-acquires
 - **Barometric speed estimation** (`updateBaro(altitude, timestampMs)`): Uses the phone barometer to constrain forward speed on ramps via `vz = v × sin(pitch)`. When |sin(pitch)| > 0.03 (≥ 1.7° grade, typical parking ramps) and coasting, a scalar QR pseudo-measurement injects `v = vz_measured / sin(pitch)` with noise `max(0.5, |vz| × 0.1)` reflecting barometer accuracy + pitch uncertainty. Chi-square gate (threshold 11.3 = 3σ) rejects implausible innovations. Requires device orientation to be set (`deviceToEnu !== null`) for pitch estimate. On flat ground (|sin(pitch)| ≤ 0.03) the update is skipped — no speed information from barometer. Addresses ramp driving where continuous altitude change provides an independent speed observable not available from IMU alone
 
@@ -402,7 +438,8 @@ interface EkfDiagnostics {
   coasting: boolean;
   lastGpsTimeMs: number;
   lastImuTimeMs: number;
-  stationary: boolean;   // true iff stillness > 0.7 AND |v| < 3.0 (matches ZUPT engagement)
+  stationary: boolean;   // true iff motionStillness > 0.7 AND |v| < 3.0 (matches ZUPT engagement)
+  motionStillness: number;
   magDeclination: number;
   robustWeight: number;
   adaNoiseScale: number;
@@ -426,6 +463,6 @@ Designed for 50–400 Hz IMU and 1–10 Hz GPS on resource-constrained devices:
 ## Validation
 
 ```bash
-npm test                 # 78 tests (9 QR verification + 69 unit)
+npm test                 # 90 tests (9 QR verification + 81 unit)
 npm run test:watch       # watch mode
 ```

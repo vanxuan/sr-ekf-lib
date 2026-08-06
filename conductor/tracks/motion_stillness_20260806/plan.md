@@ -30,12 +30,12 @@
 
 ## Phase 3: Device-domain regression hardening and docs
 
-- [ ] Task: Verify device-domain consumers unchanged
-    - [ ] Write tests: existing table-rotation, rest-mag blend, ZARU, and omegaScale tests pass unchanged with the new metric (device stillness still drives mag adaptive noise and rest-rotation).
-    - [ ] Implement: confirm no behavioral drift; adjust only if a regression is caught by the new tests.
-- [ ] Task: Update AGENTS.md and README
-    - [ ] Write tests: n/a (docs) — full suite green gate.
-    - [ ] Implement: document `motionStillness` (definition, fusion formula, consumer routing table, coasting fallback, hand-held-at-stop behavior) in AGENTS.md; sync README validation count; update test count if changed.
+- [x] Task: Verify device-domain consumers unchanged
+    - [x] Write tests: verified all existing device-domain tests pass unchanged (ZARU, table-rotation, mag adaptive noise via getStillness(), omegaScale, drift guard). 7 targeted tests run clean; full suite 90/90 green.
+    - [x] Implement: confirmed clean separation — all device consumers use getStillness() (raw IMU variance), all velocity consumers use motionStillness (fused metric). No behavioral drift detected.
+- [x] Task: Update AGENTS.md and README
+    - [x] Write tests: n/a (docs) — full suite green gate (90 tests pass after all editorial changes).
+    - [x] Implement: added Fused Motion Stillness section (definition, fresh/stale-branch formulas, device-motion evidence, consumer routing table); updated ZUPT section (weight=ms×speedGate, velR inflation=ms, disengagement without gpsMoving); updated coasting damping (ms>0.5); updated EkfDiagnostics stationary (motionStillness>0.7&&|v|<3.0, added motionStillness field); synced test counts to 90 (81+9). README: same stationary/motionStillness interface updates, test count synced.
 - [ ] Task: Conductor - User Manual Verification 'Phase 3' (Protocol in workflow.md)
 
 ## Definition of Done
