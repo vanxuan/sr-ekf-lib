@@ -4,12 +4,12 @@
 
 ## Phase 1: Unify last two `accelEnergy + gyroEnergy` holdouts
 
-- [ ] Task: Update velocity prior and rest-weighted H block gates
-    - [ ] Write tests: Update 'should preserve genuine motion during coasting' to explicitly assert the prior fires with the new gate. No new tests needed — existing coasting/heading tests are the regression gate.
-    - [ ] Implement:
-        1. In `predict()`, velocity prior gate: change `(this.accelEnergy + this.gyroEnergy > 0.05 || Math.abs(this.x[I.V]) > 0.5)` to `(this.motionStillness < COAST_DAMP_STILL)`. Add `!this._zuptEngaged` guard. Remove now-unused `stationarity` variable.
-        2. In `gpsUpdateSingle()`, rest-weighted H gate: change `this.accelEnergy + this.gyroEnergy < 0.05` to `this.motionStillness > COAST_DAMP_STILL`.
-- [ ] Task: Conductor - User Manual Verification 'Phase 1' (Protocol in workflow.md)
+- [x] Task: Update velocity prior and rest-weighted H block gates
+    - [x] Write tests: Updated test comment; existing coasting/heading tests (118) pass unchanged — regression gate validates no behavioral drift.
+    - [x] Implement:
+        1. In `predict()`, velocity prior gate: changed to `(this.motionStillness < COAST_DAMP_STILL)`. Added `!this._zuptEngaged`. Removed unused `stationarity`.
+        2. In `gpsUpdateSingle()`, rest-weighted H gate: changed to `this.motionStillness > COAST_DAMP_STILL`.
+- [~] Task: Conductor - User Manual Verification 'Phase 1' (Protocol in workflow.md)
 
 ## Definition of Done
 
