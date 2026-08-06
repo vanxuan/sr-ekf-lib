@@ -4,12 +4,12 @@
 
 ## Phase 1: Fused motionStillness metric
 
-- [ ] Task: Add `motionStillness` metric and maintenance
-    - [ ] Write tests: `tests/sr-ekf.test.ts` — motionStillness driven by `smoothedSpeed` when GPS fresh (cruise ⇒ low, stop ⇒ high); falls back to filter `v`/device-stillness proxy when GPS stale (coasting); smooth ramp, no hard binary.
-    - [ ] Implement: add private `motionStillness` field, compute in `predict()`/`updateGps()` using the fused formula (GPS-fresh `smoothedSpeed`, GPS-stale filter `v` + device-stillness proxy, `vCut` ramp).
-- [ ] Task: Expose `motionStillness` and update `stationary` diagnostic
-    - [ ] Write tests: `getDiagnostics().motionStillness` present and consistent; `stationary` follows motionStillness (hand-held-at-stop ⇒ true; mounted-cruise ⇒ false).
-    - [ ] Implement: add `motionStillness` to `EkfDiagnostics`; rewire `stationary = motionStillness > 0.7`.
+- [x] Task: Add `motionStillness` metric and maintenance `2e35848`
+    - [x] Write tests: `tests/sr-ekf.test.ts` — motionStillness driven by `smoothedSpeed` when GPS fresh (cruise ⇒ low, stop ⇒ high); falls back to filter `v`/device-stillness proxy when GPS stale (coasting); smooth ramp, no hard binary. `2e35848`
+    - [x] Implement: add private `motionStillness` field, compute in `predict()`/`updateGps()` using the fused formula (GPS-fresh `smoothedSpeed`, GPS-stale filter `v` + device-stillness proxy, `vCut` ramp). `2e35848`
+- [x] Task: Expose `motionStillness` and update `stationary` diagnostic `2e35848`
+    - [x] Write tests: `getDiagnostics().motionStillness` present and consistent; `stationary` follows motionStillness (hand-held-at-stop ⇒ true; mounted-cruise ⇒ false). `2e35848`
+    - [x] Implement: add `motionStillness` to `EkfDiagnostics`; rewire `stationary = motionStillness > 0.7`. `2e35848`
 - [ ] Task: Conductor - User Manual Verification 'Phase 1' (Protocol in workflow.md)
 
 ## Phase 2: Route velocity-domain consumers to motionStillness
