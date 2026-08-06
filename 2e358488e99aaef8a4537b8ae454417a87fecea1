@@ -1,0 +1,11 @@
+Task: Add motionStillness metric and maintenance; expose motionStillness + rewire stationary diagnostic
+
+Changes:
+- src/sr-ekf.ts: add MOTION_V_CUT (1.0) and GPS_REST_NOISE (1.0) constants; private motionStillness field; updateMotionStillness() fused formula (GPS fresh: max(0, smoothedSpeed - GPS_REST_NOISE); GPS stale/coasting: max(|v|, (1-deviceStillness)*V_CUT)); maintain in predict() and updateGps() (incl. first-fix init); add motionStillness to EkfDiagnostics; stationary = motionStillness > 0.7.
+- tests/sr-ekf.test.ts: 4 new tests covering GPS-fresh cruise->low / stop->high, rest-noise floor + smooth ramp (no hard binary), coasting fallback to filter v, device-stillness proxy when GPS stale and v small.
+
+Why: the filter conflated device stillness (IMU 3D variance) with vehicle motion stillness. A hand-held phone at a stop (high variance, GPS speed ~0) was never detected stationary, blocking ZUPT and bias learning. The fused metric decouples the two; diagnostics stationary now follows the velocity domain.
+
+Design note: GPS velocity at a real stop reports jitter (up to ~1 m/s), so speedEvidence subtracts GPS_REST_NOISE=1.0 before the V_CUT=1.0 ramp — keeps rest detection robust while smoothly replacing the old hard gpsMoving>2.0 binary. Coasting degrades to filter v + one-way device-stillness proxy.
+
+Verification: CI=true npx vitest run -> 82 passed (73 sr-ekf + 9 qr-verification). npm run build (tsc) clean.
