@@ -1,0 +1,18 @@
+Phase 2 Task 1: Extract CTRA kinematics into src/ctra.ts
+
+Red: wrote tests/ctra.test.ts with 7 unit tests for ctraDelta
+(big-omega, small-omega, zero-psi branches) and computeJacobian
+(diagonal terms, position-velocity coupling, gyro-bias derivatives,
+beta mean-reversion). Fixed two test bugs (decay diagonal was not 1;
+big-omega vs small-omega branch threshold).
+
+Green: created src/ctra.ts exporting ctraDelta (pure) and
+computeJacobian (takes state + output array as params). computeAdaptiveQ
+kept in sr-ekf.ts due to deep state coupling (74 lines, 13+ field
+accesses). Updated call sites in sr-ekf.ts to use imported functions;
+removed private ctraDelta and computeJacobian methods.
+
+Files: created src/ctra.ts, tests/ctra.test.ts; modified src/sr-ekf.ts.
+
+Verification: npx tsc BUILD_OK; 110/110 tests pass (81 sr-ekf + 9 qr +
+6 math + 7 ring-buf + 7 ctra).
