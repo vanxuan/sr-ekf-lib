@@ -17,9 +17,9 @@
 - [x] Task: ZUPT gating keys on motionStillness `dac402c`
     - [x] Write tests: hand-held phone at a stop (high device variance, GPS speed ≈ 0) engages ZUPT and learns bias; mounted phone cruising (device-still ≈ 1, GPS speed high) does NOT engage ZUPT; removes reliance on hard `gpsMoving > 2.0`. `dac402c`
     - [x] Implement: `zuptWeight = motionStillness × speedGate` in `predict()`; drop the `gpsMoving` binary override in favor of the continuous ramp. `dac402c`
-- [ ] Task: Coasting velocity damping keys on motionStillness
-    - [ ] Write tests: hand-held stop during coasting (device variance high, filter `v` → 0) still damps velocity to 0; genuine motion during coasting (motionStillness low) preserved.
-    - [ ] Implement: coasting `stationarity` gate uses `motionStillness` instead of `accelEnergy + gyroEnergy`.
+- [x] Task: Coasting velocity damping keys on motionStillness `7c71acf`
+    - [x] Write tests: hand-held stop during coasting (device variance high, filter `v` → 0) still damps velocity to 0; genuine motion during coasting (motionStillness low) preserved. `7c71acf`
+    - [x] Implement: coasting `stationarity` gate uses `motionStillness` instead of `accelEnergy + gyroEnergy`. `7c71acf`
 - [ ] Task: Unify GPS `stationaryWeight` onto motionStillness
     - [ ] Write tests: GPS velocity z-blend / velR inflation consistent with motionStillness at rest-exit and cruise (no regression in stationary-weight behavior).
     - [ ] Implement: derive `stationaryWeight` from the shared `motionStillness` metric instead of the inline `smoothedSpeed` EMA (keep smoothing).
