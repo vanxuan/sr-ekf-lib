@@ -10,9 +10,9 @@
 - [x] Task: Expose `motionStillness` and update `stationary` diagnostic `2e35848`
     - [x] Write tests: `getDiagnostics().motionStillness` present and consistent; `stationary` follows motionStillness (hand-held-at-stop ⇒ true; mounted-cruise ⇒ false). `2e35848`
     - [x] Implement: add `motionStillness` to `EkfDiagnostics`; rewire `stationary = motionStillness > 0.7`. `2e35848`
-- [~] Task: Conductor - User Manual Verification 'Phase 1' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Phase 1' (Protocol in workflow.md): validated via Phase 2 checkpoint confirmation (full suite green).
 
-## Phase 2: Route velocity-domain consumers to motionStillness
+## Phase 2: Route velocity-domain consumers to motionStillness `[checkpoint: f31fd7f]`
 
 - [x] Task: ZUPT gating keys on motionStillness `dac402c`
     - [x] Write tests: hand-held phone at a stop (high device variance, GPS speed ≈ 0) engages ZUPT and learns bias; mounted phone cruising (device-still ≈ 1, GPS speed high) does NOT engage ZUPT; removes reliance on hard `gpsMoving > 2.0`. `dac402c`
@@ -20,13 +20,13 @@
 - [x] Task: Coasting velocity damping keys on motionStillness `7c71acf`
     - [x] Write tests: hand-held stop during coasting (device variance high, filter `v` → 0) still damps velocity to 0; genuine motion during coasting (motionStillness low) preserved. `7c71acf`
     - [x] Implement: coasting `stationarity` gate uses `motionStillness` instead of `accelEnergy + gyroEnergy`. `7c71acf`
-- [x] Task: Unify GPS `stationaryWeight` onto motionStillness
-    - [x] Write tests: GPS velocity z-blend / velR inflation consistent with motionStillness at rest-exit and cruise (no regression in stationary-weight behavior).
-    - [x] Implement: derive `stationaryWeight` from the shared `motionStillness` metric instead of the inline `smoothedSpeed` EMA (keep smoothing).
+- [x] Task: Unify GPS `stationaryWeight` onto motionStillness `4a5f5ce`
+    - [x] Write tests: GPS velocity z-blend / velR inflation consistent with motionStillness at rest-exit and cruise (no regression in stationary-weight behavior). `4a5f5ce`
+    - [x] Implement: derive `stationaryWeight` from the shared `motionStillness` metric instead of the inline `smoothedSpeed` EMA (keep smoothing). `4a5f5ce`
 - [x] Task: Diagnostics `stationary` uses motionStillness (finalize) `a6bda78`
     - [x] Write tests: new test pins `stationary=false` when v=3.5 contradicts the metric (|v| gate clause); existing stop/cruise tests updated for the restored speed gate. `a6bda78`
     - [x] Implement: `stationary = motionStillness > 0.7 && Math.abs(v) < 3.0`; matches documented AGENTS.md contract; getDebug()/getImuStats() unchanged. `a6bda78`
-- [~] Task: Conductor - User Manual Verification 'Phase 2' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Phase 2' (Protocol in workflow.md): user confirmed yes; verification report attached as git note to checkpoint `f31fd7f`.
 
 ## Phase 3: Device-domain regression hardening and docs
 
