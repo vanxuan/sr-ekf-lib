@@ -1,0 +1,13 @@
+Phase 1 Task 3: Extract config types, defaults, constants into src/config.ts
+
+No Red tests needed — types/constants implicitly tested by the full suite.
+
+Green: created src/config.ts with N, M, PRE, MAG_PRE, NTRI, I (as const
+object replacing const enum), EkfConfig, NavigationSolution, EkfDiagnostics,
+DEFAULTS, EPS, and all motion constants (MOTION_V_CUT, GPS_REST_NOISE,
+etc.). Re-exported EkfConfig, NavigationSolution, EkfDiagnostics from
+sr-ekf.ts for downstream consumers.
+
+Files: created src/config.ts; modified src/sr-ekf.ts.
+
+Verification: 103/103 tests pass unchanged.
