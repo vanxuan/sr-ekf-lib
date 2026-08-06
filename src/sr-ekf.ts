@@ -494,11 +494,10 @@ export class SrEkf {
     // after ~30s (car may have turned/stopped).  This addresses the multi-
     // basement scenario where continuous motion without GPS causes v to drift
     // ~0.6 m/s per 60s from uncorrected aBiasX.
-    if (this.coasting && this.coastSpeedReady && this.coastSpeed > 0) {
+    if (this.coasting && this.coastSpeedReady && this.coastSpeed > 0 && !this._zuptEngaged) {
       const coastTimeS = Math.max(0, (this.lastImuTimeMs - this.lastGpsTimeMs)) / 1000;
-      const stationarity = this.accelEnergy + this.gyroEnergy;
       // Only fire when car is genuinely moving (not stopped — ZUPT handles that)
-      if (stationarity > 0.05 || Math.abs(this.x[I.V]) > 0.5) {
+      if (this.motionStillness < COAST_DAMP_STILL) {
         // Prior R grows with coast time: tight at onset (R=2), loose after 30s (R≈20)
         const rPrior = Math.min(2.0 + coastTimeS * 0.6, 20.0);
         // Innovation is z − h = coastSpeed − v (measurement z is the captured
@@ -1454,7 +1453,7 @@ export class SrEkf {
     // otherwise a start-of-motion fix would be blocked because filter v is still
     // ~0 (ZUPT-held) and IMU energy is momentarily low, freezing heading at the
     // misaligned rest bearing.
-    if (this.accelEnergy + this.gyroEnergy < 0.05 && this.lastGpsSpeed < 0.3) {
+    if (this.motionStillness > COAST_DAMP_STILL && this.lastGpsSpeed < 0.3) {
       const restW = Math.max(0, Math.min((1.5 - Math.abs(this.x[I.V])) / 1.0, 1));
       this.tmpH[2][I.PSI] *= (1 - restW); this.tmpH[2][I.BETA] *= (1 - restW);
       this.tmpH[3][I.PSI] *= (1 - restW); this.tmpH[3][I.BETA] *= (1 - restW);

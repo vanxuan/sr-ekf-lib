@@ -649,8 +649,9 @@ describe('SrEkf', () => {
     // Mounted cruise in a tunnel: device-still, GPS-confirmed 8 m/s, filter v
     // tracking it. motionStillness is LOW so neither ZUPT nor the coasting
     // velocity damping may drag v toward zero — the coasting velocity prior
-    // holds it at coastSpeed. The old `accelEnergy + gyroEnergy < 0.1` gate
-    // fired on a smooth cruise (zero IMU energy) and killed the velocity.
+    // holds it at coastSpeed. The prior gates on motionStillness < COAST_DAMP_STILL
+    // (matching the coasting damping threshold), so a smooth cruise with ms ≈ 0
+    // keeps the prior engaged and holds v at coastSpeed.
     const ekf = new SrEkf()
     ekf.reset(0, 0, 8, 0)
     ekf.updateGps(0, 0, 8, 0, 0) // GPS init cruising at 8 m/s
