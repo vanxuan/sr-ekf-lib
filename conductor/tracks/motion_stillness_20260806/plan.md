@@ -20,9 +20,9 @@
 - [x] Task: Coasting velocity damping keys on motionStillness `7c71acf`
     - [x] Write tests: hand-held stop during coasting (device variance high, filter `v` → 0) still damps velocity to 0; genuine motion during coasting (motionStillness low) preserved. `7c71acf`
     - [x] Implement: coasting `stationarity` gate uses `motionStillness` instead of `accelEnergy + gyroEnergy`. `7c71acf`
-- [ ] Task: Unify GPS `stationaryWeight` onto motionStillness
-    - [ ] Write tests: GPS velocity z-blend / velR inflation consistent with motionStillness at rest-exit and cruise (no regression in stationary-weight behavior).
-    - [ ] Implement: derive `stationaryWeight` from the shared `motionStillness` metric instead of the inline `smoothedSpeed` EMA (keep smoothing).
+- [x] Task: Unify GPS `stationaryWeight` onto motionStillness
+    - [x] Write tests: GPS velocity z-blend / velR inflation consistent with motionStillness at rest-exit and cruise (no regression in stationary-weight behavior).
+    - [x] Implement: derive `stationaryWeight` from the shared `motionStillness` metric instead of the inline `smoothedSpeed` EMA (keep smoothing).
 - [ ] Task: Diagnostics `stationary` uses motionStillness (finalize)
     - [ ] Write tests: `stationary` true for a hand-held stop, false for mounted cruise, matches ZUPT engagement.
     - [ ] Implement: verify/refine `stationary` wiring; ensure `getDebug()`/`getImuStats()` unchanged.
