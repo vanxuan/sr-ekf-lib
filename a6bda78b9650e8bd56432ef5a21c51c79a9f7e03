@@ -1,0 +1,25 @@
+Phase 2 Task 4: Finalize stationary diagnostic with |v| < 3.0 speed gate.
+
+Red: one new test 'should report stationary=false when filter velocity
+contradicts the metric (|v| >= 3 speed gate)' — reset(v=3.5), GPS-init at
+rest (ms=1), asserts stationary=false. Fails under the old impl (ms-only
+gate) because v=3.5 passes ms>0.7 with no velocity check. Pins the
+documented EkfDiagnostics contract: 'motionStillness > 0.7 AND |v| < 3.0
+(matches ZUPT engagement)' — restoring the clause that was dropped in the
+Phase 1 rewire (2e35848).
+
+Green: getDiagnostics().stationary changed from 'this.motionStillness > 0.7'
+to 'this.motionStillness > 0.7 && Math.abs(this.x[I.V]) < 3.0'. Restores
+the pre-track historical implementation (HEAD~20: getStillness()>0.7 &&
+Math.abs(v)<3.0). getDebug()/getImuStats() unchanged — they have no
+stationary field.
+
+Existing test adjustment: 'should expose motionStillness driven by GPS
+speed when GPS is fresh' asserted stationary=true immediately after a hard
+deceleration (10→0 in 2s), but v=3.044 at that point under the gate clause,
+making stationary=false. Extended the stop-hold phase so v converges to 0
+before the assertion (ZUPT + position updates pull it there over ~7s).
+Makes the test also verify that stationary eventually flips true — a better
+validation of the contract.
+
+Full suite: 90 tests pass (81 sr-ekf + 9 qr-verification), npx tsc BUILD_OK.
