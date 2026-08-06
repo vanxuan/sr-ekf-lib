@@ -27,12 +27,12 @@
 
 ## Phase 3: Trim sr-ekf.ts entry point and final cleanup
 
-- [ ] Task: Update `sr-ekf.ts` to cleanly import all modules, re-export public types
-    - [ ] Write tests: n/a — existing 90+ tests are the regression gate.
-    - [ ] Implement: Remove now-duplicate imports/inline definitions; verify `SrEkf` class methods reference imported functions; re-export `NavigationSolution`, `EkfDiagnostics`, `EkfConfig` from the entry point for downstream consumers.
-- [ ] Task: Verify build and publish artifacts
-    - [ ] Write tests: n/a — `npx tsc` is the gate.
-    - [ ] Implement: Run `npm run build`; verify `dist/sr-ekf.js` + `dist/sr-ekf.d.ts` produced; verify no new exports leak. Update `package.json` `files` whitelist if needed; update imports in test imports if `tsconfig.json` path resolution changed.
+- [x] Task: Update `sr-ekf.ts` to cleanly import all modules, re-export public types
+    - [x] Write tests: n/a — existing 118 tests are the regression gate.
+    - [x] Implement: Re-exports set up in Phase 1 (`export { EkfConfig, NavigationSolution, EkfDiagnostics } from './config'`). All inline definitions removed. `SrEkf` class references imported functions via thin wrappers where needed.
+- [x] Task: Verify build and publish artifacts
+    - [x] Write tests: n/a — `npx tsc` is the gate.
+    - [x] Implement: `npm run build` produces `dist/sr-ekf.js` + `dist/sr-ekf.d.ts` plus module files. Stale `dist/matrix.*` removed. `package.json` exports map still points to `dist/sr-ekf.js` as single entry point. No new public exports leak.
 - [ ] Task: Conductor - User Manual Verification 'Phase 3' (Protocol in workflow.md)
 
 ## Definition of Done
