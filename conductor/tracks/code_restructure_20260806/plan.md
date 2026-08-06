@@ -15,7 +15,7 @@
     - [x] Implement: Created `src/config.ts` with `EkfConfig`, defaults, `I` (as const object), `N`/`M`/`PRE`/`MAG_PRE`/`NTRI`, `DEFAULTS`, `EPS`, all motion constants. Re-exported types from `sr-ekf.ts` for downstream consumers.
 - [x] Task: Conductor - User Manual Verification 'Phase 1' (Protocol in workflow.md): user confirmed yes; verification report attached to checkpoint `e915fb5`.
 
-## Phase 2: Extract pure-domain logic (CTRA kinematics, diagnostics)
+## Phase 2: Extract pure-domain logic (CTRA kinematics, diagnostics) `[checkpoint: acb53ad]`
 
 - [x] Task: Extract CTRA kinematics into `src/ctra.ts`
     - [x] Write tests: `tests/ctra.test.ts` — 7 unit tests for `ctraDelta()` (big-ω, small-ω, zero-psi branches) and `computeJacobian()` (diagonal, position-velocity, gyro-bias derivatives, beta decay).
@@ -23,7 +23,7 @@
 - [x] Task: Extract diagnostic readouts into `src/diagnostics.ts`
     - [x] Write tests: `tests/diagnostics.test.ts` — 8 unit tests for `wmean`, `wstd`, `buildDiagnostics`, `buildDebug`, `buildImuStats`.
     - [x] Implement: Created `src/diagnostics.ts` with pure snapshot-formatting functions; updated `sr-ekf.ts` `getDiagnostics()`/`getDebug()`/`getImuStats()` to delegate. All diagnostic tests pass unchanged (118 tests).
-- [ ] Task: Conductor - User Manual Verification 'Phase 2' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Phase 2' (Protocol in workflow.md): user confirmed yes; verification report attached to checkpoint `acb53ad`.
 
 ## Phase 3: Trim sr-ekf.ts entry point and final cleanup
 
