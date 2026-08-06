@@ -50,7 +50,7 @@ const DEFAULTS = {
   useLateralAccel: true
 };
 
-const EPS = 1e-4, TWO_PI = 2 * Math.PI;
+const EPS = 1e-4;
 // Fused motion-stillness ramp: motionStillness = clamp(1 − speedEvidence / vCut).
 // GPS velocity at a real stop still reports jitter (typically up to ~1 m/s on
 // phone IMU/GPS), so speeds at or below GPS_REST_NOISE read as fully still and
@@ -95,7 +95,7 @@ const DEVICE_ACTIVITY_FLOOR = 0.01;
 // validated by the 'preserve genuine motion during coasting' test).
 const COAST_DAMP_STILL = 0.5;
 
-import { matCreate, matLowerToFull, matLowerToFullInto, chol4x4, cholSolve4, ensureDiag } from './matrix';
+import { matCreate, matLowerToFull, matLowerToFullInto, chol4x4, cholSolve4, ensureDiag, qrInPlace, wrapAngle, copySfromQR } from './math';
 
 class RingBuf {
   private buf: Float64Array;
@@ -267,7 +267,7 @@ export class SrEkf {
     this.x[I.X] = x;
     this.x[I.Y] = y;
     this.x[I.V] = v;
-    this.x[I.PSI] = this.wrapAngle(psi);
+    this.x[I.PSI] = wrapAngle(psi);
     this.x[I.BETA] = 0;
     this.x[I.A_BIAS_X] = 0;
     this.x[I.G_BIAS_Z] = 0;
@@ -527,7 +527,7 @@ export class SrEkf {
     this.x[I.V] = Math.max(0, v + a * dt);
     const vehMoving = Math.min(absV / 0.5, 1);
     const omegaScale = vehMoving > 0 ? Math.max(vehMoving, stillness) : 1;
-    this.x[I.PSI] = this.wrapAngle(psi + omegaAvg * dt * omegaScale);
+    this.x[I.PSI] = wrapAngle(psi + omegaAvg * dt * omegaScale);
     this.x[I.BETA] *= Math.exp(-dt / betaTau);
     // A_BIAS_X updated only via GPS velocity corrections (no decay needed)
 
@@ -599,7 +599,7 @@ export class SrEkf {
           for (let k = 0; k <= lim; k++) p += this.S[i][k] * SV[k];
           this.x[i] += p / sInnov * innov;
         }
-        this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
+        this.x[I.PSI] = wrapAngle(this.x[I.PSI]);
         // QR covariance update (scalar QR, same pattern as lateral-accel/mag)
         const A = this.tmpLatPre;
         for (let i = 0; i < MAG_PRE; i++) A[i].fill(0);
@@ -641,7 +641,7 @@ export class SrEkf {
           for (let k = 0; k <= lim; k++) p += this.S[i][k] * SV[k];
           this.x[i] += p / sInnov * innov;
         }
-        this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
+        this.x[I.PSI] = wrapAngle(this.x[I.PSI]);
         // QR covariance update (scalar QR, same pattern as lateral-accel/mag)
         const A = this.tmpLatPre;
         for (let i = 0; i < MAG_PRE; i++) A[i].fill(0);
@@ -671,7 +671,7 @@ export class SrEkf {
       this.smoothedSpeed = spd;
       if (spd > 0.1) {
         this.x[I.V] = spd;
-        this.x[I.PSI] = this.wrapAngle(Math.atan2(vy, vx));
+        this.x[I.PSI] = wrapAngle(Math.atan2(vy, vx));
       }
       this.gpsInitialized = true;
       this.gpsInitTimeMs = timestampMs;
@@ -725,7 +725,7 @@ export class SrEkf {
             const spd = Math.sqrt(vx * vx + vy * vy);
             this.lastGpsSpeed = spd;
             this.x[I.V] = spd;
-            this.x[I.PSI] = this.wrapAngle(Math.atan2(vy, vx));
+            this.x[I.PSI] = wrapAngle(Math.atan2(vy, vx));
             this.x[I.BETA] = 0;
           }
         }
@@ -793,8 +793,8 @@ export class SrEkf {
         Math.abs(this.lastOmega) < 0.1 &&
         dxGps * dxGps + dyGps * dyGps < 400) {
       const gpsPsi = Math.atan2(vy, vx);
-      if (Math.abs(this.wrapAngle(gpsPsi - this.x[I.PSI])) > 0.26) {
-        this.x[I.PSI] = this.wrapAngle(gpsPsi);
+      if (Math.abs(wrapAngle(gpsPsi - this.x[I.PSI])) > 0.26) {
+        this.x[I.PSI] = wrapAngle(gpsPsi);
         this.x[I.BETA] = 0;
         this.S[I.PSI][I.PSI] = Math.max(this.S[I.PSI][I.PSI], Math.min(velR / this.lastGpsSpeed, 0.5));
       }
@@ -958,7 +958,7 @@ export class SrEkf {
       for (let k = 0; k <= lim; k++) p += this.S[i][k] * hs[k];
       this.x[i] += p / sInnov * innov;
     }
-    this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
+    this.x[I.PSI] = wrapAngle(this.x[I.PSI]);
     // QR covariance update (scalar QR, same pattern as lateral-accel/mag)
     const A = this.tmpLatPre;
     for (let i = 0; i < MAG_PRE; i++) A[i].fill(0);
@@ -1071,49 +1071,12 @@ export class SrEkf {
 
   // ─── private helpers ────────────────────────────────────────────
 
-  private wrapAngle(a: number): number {
-    a = a % TWO_PI;
-    if (a > Math.PI) a -= TWO_PI;
-    if (a <= -Math.PI) a += TWO_PI;
-    return a;
-  }
-
   private copySfromQR(Q: Float64Array[], offset: number): void {
-    for (let i = 0; i < N; i++) {
-      for (let j = 0; j <= i; j++) this.S[i][j] = Q[offset + j][offset + i];
-      for (let j = i + 1; j < N; j++) this.S[i][j] = 0;
-    }
-    ensureDiag(this.S);
-    let tr = 0;
-    for (let i = 0; i < N; i++) {
-      for (let j = 0; j <= i; j++) {
-        const v = this.S[i][j];
-        tr += v * v;
-      }
-    }
-    this._traceCache = tr;
+    this._traceCache = copySfromQR(Q, offset, this.S, N);
   }
 
   private qrInPlace(A: Float64Array[], m: number, n: number, vBuf: Float64Array): void {
-    for (let k = 0; k < Math.min(m, n); k++) {
-      let nrm = 0;
-      for (let i = k; i < m; i++) nrm += A[i][k] * A[i][k];
-      nrm = Math.sqrt(nrm);
-      if (nrm < 1e-15) continue;
-      const sign = A[k][k] >= 0 ? 1 : -1;
-      vBuf[0] = A[k][k] + sign * nrm;
-      const len = m - k;
-      for (let i = 1; i < len; i++) vBuf[i] = A[k + i][k];
-      let beta = 0;
-      for (let i = 0; i < len; i++) beta += vBuf[i] * vBuf[i];
-      beta = 2 / beta;
-      for (let j = k; j < n; j++) {
-        let s = 0;
-        for (let i = 0; i < len; i++) s += vBuf[i] * A[k + i][j];
-        s *= beta;
-        for (let i = 0; i < len; i++) A[k + i][j] -= s * vBuf[i];
-      }
-    }
+    qrInPlace(A, m, n, vBuf);
   }
 
   private safeguardState(): void {
@@ -1180,7 +1143,7 @@ export class SrEkf {
     this.x[I.X] = gpsX;
     this.x[I.Y] = gpsY;
     this.x[I.V] = gpsV;
-    this.x[I.PSI] = this.wrapAngle(gpsPsi);
+    this.x[I.PSI] = wrapAngle(gpsPsi);
     this.x[I.BETA] = 0;
     this.x[I.A_BIAS_X] = prevABiasX;
     this.x[I.G_BIAS_Z] = prevGBiasZ;
@@ -1432,14 +1395,6 @@ if (absOmega > EPS) {
       if (this.gxWindow.length > 0) this.gxWindow.shift();
       if (this.gyWindow.length > 0) this.gyWindow.shift();
     }
-  }
-
-  private windowVariance(buf: RingBuf): number {
-    if (buf.length < 2) return 0;
-    let sum = 0, sumSq = 0;
-    for (let i = 0; i < buf.length; i++) { const v = buf.get(i); sum += v; sumSq += v * v; }
-    const n = buf.length, mean = sum / n;
-    return Math.max(0, sumSq / n - mean * mean);
   }
 
   getStillness(): number {
@@ -1761,7 +1716,7 @@ if (absOmega > EPS) {
       const vxM = this.tmpZ[2], vyM = this.tmpZ[3];
       const speedM2 = vxM * vxM + vyM * vyM;
       if (speedM2 > 1.0 && vxP * vxM + vyP * vyM < -0.5 * this.x[I.V] * this.x[I.V]) {
-        this.x[I.PSI] = this.wrapAngle(this.x[I.PSI] + Math.PI);
+        this.x[I.PSI] = wrapAngle(this.x[I.PSI] + Math.PI);
         for (let j = 0; j < I.PSI; j++) this.S[I.PSI][j] = 0;
         for (let j = I.PSI + 1; j < N; j++) this.S[j][I.PSI] = 0;
         this.S[I.PSI][I.PSI] = Math.max(this.S[I.PSI][I.PSI], 1.5);
@@ -1864,7 +1819,7 @@ if (absOmega > EPS) {
       for (let j = 0; j <= i; j++) s += this.S[i][j] * z[j];
       this.x[i] += s;
     }
-    this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
+    this.x[I.PSI] = wrapAngle(this.x[I.PSI]);
 
     // Velocity sign-ambiguity backstop. The state (v<0, ψ) and (v>0, ψ+π)
     // represent the identical velocity vector. After a U-turn with heading
@@ -1893,8 +1848,8 @@ if (absOmega > EPS) {
         this.x[I.V] = 0;
       } else {
         this.x[I.V] = -this.x[I.V];
-        this.x[I.PSI] = this.wrapAngle(this.x[I.PSI] + Math.PI);
-        this.x[I.BETA] = this.wrapAngle(this.x[I.BETA] + Math.PI);
+        this.x[I.PSI] = wrapAngle(this.x[I.PSI] + Math.PI);
+        this.x[I.BETA] = wrapAngle(this.x[I.BETA] + Math.PI);
         for (let j = 0; j <= I.V; j++) this.S[I.V][j] = -this.S[I.V][j];
         for (let i = I.V; i < N; i++) this.S[i][I.V] = -this.S[i][I.V];
       }
@@ -2040,7 +1995,7 @@ if (absOmega > EPS) {
     // update below, not by re-snapping an already-learned ψ.
     const initCovHeading = this.config.initialCovariance.heading!;
     const psiCov = this.S[I.PSI][I.PSI] * this.S[I.PSI][I.PSI];
-    const psiMag = this.wrapAngle(bearing + this.x[I.MAG_DECL]);
+    const psiMag = wrapAngle(bearing + this.x[I.MAG_DECL]);
     if (psiCov > initCovHeading * 0.99)
       this.x[I.PSI] = psiMag;
 
@@ -2049,7 +2004,7 @@ if (absOmega > EPS) {
     // meaningfully trusted again.
     if (magHeadingTrust < 0.2) { this._debugMagTrust = magHeadingTrust; return; }
 
-    const innov = this.wrapAngle(psiMag - this.x[I.PSI]);
+    const innov = wrapAngle(psiMag - this.x[I.PSI]);
     this._debugInnovDeg = Math.abs(innov) * 180 / Math.PI;
     const stillness = this.getStillness();
     // Heading variance from Cholesky factor — used in gate threshold so that
@@ -2125,11 +2080,11 @@ if (absOmega > EPS) {
       // At α=1.0 the lag drops to ~0° while convergence after rotation stops is still <1.5s.
       const alpha = 0.5 + 0.5 * Math.min(Math.abs(innov), 1);
       this._debugMagAlpha = alpha;
-      this.x[I.PSI] = this.wrapAngle(this.x[I.PSI] + innov * alpha);
+      this.x[I.PSI] = wrapAngle(this.x[I.PSI] + innov * alpha);
     } else {
       this._debugMagAlpha = 0;
       for (let i = 0; i < N; i++) this.x[i] += this.tmpMagHS[i] / S * innov * magHeadingTrust;
-      this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
+      this.x[I.PSI] = wrapAngle(this.x[I.PSI]);
     }
 
     for (let i = 0; i < MAG_PRE; i++) this.tmpMagAT[i].fill(0);
@@ -2167,7 +2122,7 @@ if (absOmega > EPS) {
       for (let k = 0; k <= i; k++) ph += this.S[i][k] * hs[k];
       this.x[i] += ph / Si * innov;
     }
-    this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
+    this.x[I.PSI] = wrapAngle(this.x[I.PSI]);
 
     // QR covariance update (scalar QR, same pattern as mag)
     const A = this.tmpLatPre;
@@ -2320,7 +2275,7 @@ if (absOmega > EPS) {
       for (let k = 0; k <= lim; k++) p += this.S[i][k] * hs[k];
       this.x[i] += p / sInnov * innov;
     }
-    this.x[I.PSI] = this.wrapAngle(this.x[I.PSI]);
+    this.x[I.PSI] = wrapAngle(this.x[I.PSI]);
 
     // QR covariance update (scalar QR, same pattern as mag)
     const A = this.tmpLatPre;

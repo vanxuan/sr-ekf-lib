@@ -1,3 +1,5 @@
+export const TWO_PI = 2 * Math.PI;
+
 export function matCreate(rows: number, cols: number): Float64Array[] {
   const m: Float64Array[] = new Array(rows);
   for (let i = 0; i < rows; i++) m[i] = new Float64Array(cols);
@@ -78,4 +80,49 @@ export function traceOfP(S: Float64Array[]): number {
     for (let j = 0; j <= i; j++)
       t += S[i][j] * S[i][j];
   return t;
+}
+
+export function qrInPlace(A: Float64Array[], m: number, n: number, vBuf: Float64Array): void {
+  for (let k = 0; k < Math.min(m, n); k++) {
+    let nrm = 0;
+    for (let i = k; i < m; i++) nrm += A[i][k] * A[i][k];
+    nrm = Math.sqrt(nrm);
+    if (nrm < 1e-15) continue;
+    const sign = A[k][k] >= 0 ? 1 : -1;
+    vBuf[0] = A[k][k] + sign * nrm;
+    const len = m - k;
+    for (let i = 1; i < len; i++) vBuf[i] = A[k + i][k];
+    let beta = 0;
+    for (let i = 0; i < len; i++) beta += vBuf[i] * vBuf[i];
+    beta = 2 / beta;
+    for (let j = k; j < n; j++) {
+      let s = 0;
+      for (let i = 0; i < len; i++) s += vBuf[i] * A[k + i][j];
+      s *= beta;
+      for (let i = 0; i < len; i++) A[k + i][j] -= s * vBuf[i];
+    }
+  }
+}
+
+export function wrapAngle(a: number): number {
+  a = a % TWO_PI;
+  if (a > Math.PI) a -= TWO_PI;
+  if (a <= -Math.PI) a += TWO_PI;
+  return a;
+}
+
+export function copySfromQR(Q: Float64Array[], offset: number, S: Float64Array[], N: number): number {
+  for (let i = 0; i < N; i++) {
+    for (let j = 0; j <= i; j++) S[i][j] = Q[offset + j][offset + i];
+    for (let j = i + 1; j < N; j++) S[i][j] = 0;
+  }
+  ensureDiag(S);
+  let tr = 0;
+  for (let i = 0; i < N; i++) {
+    for (let j = 0; j <= i; j++) {
+      const v = S[i][j];
+      tr += v * v;
+    }
+  }
+  return tr;
 }
