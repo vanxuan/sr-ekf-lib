@@ -1,0 +1,14 @@
+ZUPT gating on motionStillness (dac402c) — verification:
+- New tests (4 added this task + 1 tilted-mount regression):
+  - hand-held stop (az-tremor, GPS 0): v<0.2, |aBiasX-0.06|<0.06, stationary=true
+  - mounted cruise (device-still, GPS 10): motionStillness<0.1, v>9.5, ZUPT off
+  - tilted mount (constant ax=1.5): v<0.2, aBiasX>1.2, stationary=true
+  - walking (GPS 1.3, step energy): v≈1.283 (tol 0.2), ZUPT disengages
+  - pickup after stationary (GPS frozen 0, ax=2): v=2.0, stationary=false
+- Regressions fixed along the way:
+  - smoothedSpeed now seeded at GPS init so fresh branch is active immediately
+  - stale/coasting branch v-evidence scaled by MOTION_V_CUT_STALE=9 (corrupted-v
+    recovery envelope preserved); device evidence bias-invariant (raw forward-axis
+    variance + gyro + variance-gated raw |ax|), so decel-learned accel-bias error
+    or tilted-mount constant ax never block ZUPT at a real stop
+- Full suite 85 passed (76 sr-ekf + 9 qr-verification), npm run build clean
