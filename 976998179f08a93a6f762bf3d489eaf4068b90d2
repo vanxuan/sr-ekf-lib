@@ -1,0 +1,17 @@
+Phase 1 Task 1: Unify last two accelEnergy+gyroEnergy holdouts onto motionStillness
+
+Red: updated test comment; existing coasting tests are the regression gate.
+All existing tests pass unchanged — behavioral guard validates no regression.
+
+Green:
+1. Velocity prior (predict(), line ~497-501): gate changed from
+   '(this.accelEnergy + this.gyroEnergy > 0.05 || |v| > 0.5)' to
+   '(this.motionStillness < COAST_DAMP_STILL)'. Added '!_zuptEngaged'
+   guard. Removed now-unused 'stationarity' variable.
+2. Rest-weighted H block (gpsUpdateSingle(), line ~1457): gate changed
+   from 'this.accelEnergy + this.gyroEnergy < 0.05' to
+   'this.motionStillness > COAST_DAMP_STILL'.
+
+Files: modified src/sr-ekf.ts, tests/sr-ekf.test.ts.
+
+Verification: 118/118 tests pass, npx tsc BUILD_OK.
