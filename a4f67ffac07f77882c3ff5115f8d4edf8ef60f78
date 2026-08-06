@@ -1,0 +1,22 @@
+Phase 1 Task 1: Extract matrix/QR math into src/math.ts
+
+Red: wrote tests/math.test.ts with 6 unit tests:
+- qrInPlace produces upper-triangular R
+- wrapAngle normalizes to (-π, π]
+- ensureDiag flips columns with negative diagonal
+- chol4x4 + cholSolve4 solve a 4x4 system
+- matLowerToFull reconstructs P = S·S^T
+- traceOfP computes trace
+
+Green: created src/math.ts consolidating all functions from
+src/matrix.ts + qrInPlace, wrapAngle, copySfromQR from sr-ekf.ts.
+Kept qrInPlace and copySfromQR as private thin wrappers in sr-ekf.ts
+(calling the imported functions) so call sites (this.qrInPlace,
+this.copySfromQR) remain unchanged — minimal diff, exact numerical
+preservation. Deleted src/matrix.ts. TWO_PI moved into math.ts.
+
+Files: created src/math.ts, tests/math.test.ts; modified src/sr-ekf.ts;
+deleted src/matrix.ts.
+
+Verification: npx tsc BUILD_OK, npx vitest run — 96/96 tests pass
+(81 sr-ekf + 9 qr-verification + 6 math).
