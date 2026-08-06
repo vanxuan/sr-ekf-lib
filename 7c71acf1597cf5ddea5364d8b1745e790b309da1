@@ -1,0 +1,9 @@
+Verify 7c71acf — Phase 2 Task 2 (coasting velocity damping keys on motionStillness).
+
+Design: damping gate motionStillness > 0.5 (COAST_DAMP_STILL) replaces accelEnergy+gyroEnergy < 0.1; updateMotionStillness stale-branch device proxy keyed on FORWARD axis (exp(-(varAx+varAy)/0.09)) instead of 3D getStillness(); velocity-prior innovation sign flipped h-z -> z-h.
+
+Red test: 'should preserve genuine motion during coasting (motionStillness low)' failed on old code (ms=0.70, v collapsed) because the energy gate fired on a zero-IMU 8 m/s cruise; now passes (ms<0.2, v>7 over 12s coast).
+
+Behavioral guard (passes both old and new): 'hand-held tunnel stop with stale aBiasX=-0.8 + vertical tremor' holds v<0.2 and re-learns aBiasX toward 0. Old code passed this only via the transient energy-EMA lag window (probe: aBiasX re-learned to -0.009 in ~100 steps before accelE could rise to 0.16); new code engages ZUPT directly (forward proxy -> ms=1).
+
+Prior sign bug exposed by the 12s cruise test: probe showed v 7.99->2.6 and aBiasX 0->0.425 runaway (positive feedback, v pulled away from coastSpeed). Flipping innov to coastSpeed - v (z-h, consistent with damping/ZUPT) makes it stable: 87/87 tests green, tsc clean.
