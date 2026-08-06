@@ -10,9 +10,9 @@
 - [x] Task: Extract RingBuf into `src/ring-buf.ts`
     - [x] Write tests: `tests/ring-buf.test.ts` — 7 unit tests for push, shift, get, wrap-around, clear, capacity.
     - [x] Implement: Created `src/ring-buf.ts` with `RingBuf` class; imported in `sr-ekf.ts`; removed inline definition. Fixed latent shift() bug (computed index before decrement). All window-dependent tests pass unchanged (103 tests).
-- [ ] Task: Extract config types, defaults, and constants into `src/config.ts`
-    - [ ] Write tests: n/a (types/constants — implicitly tested by existing suite).
-    - [ ] Implement: Create `src/config.ts` with `EkfConfig`, defaults, `I` index constants, module-level constants (EPS, GPS_REST_NOISE, etc.); import in `sr-ekf.ts`.
+- [x] Task: Extract config types, defaults, and constants into `src/config.ts`
+    - [x] Write tests: n/a (types/constants — implicitly tested by existing suite).
+    - [x] Implement: Created `src/config.ts` with `EkfConfig`, defaults, `I` (as const object), `N`/`M`/`PRE`/`MAG_PRE`/`NTRI`, `DEFAULTS`, `EPS`, all motion constants. Re-exported types from `sr-ekf.ts` for downstream consumers.
 - [ ] Task: Conductor - User Manual Verification 'Phase 1' (Protocol in workflow.md)
 
 ## Phase 2: Extract pure-domain logic (CTRA kinematics, diagnostics)
