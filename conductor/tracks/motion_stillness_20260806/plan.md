@@ -2,7 +2,7 @@
 
 > Workflow: Test-Driven Development. Every feature task is split into a "Write Tests" (Red) sub-task followed by an "Implement Feature" (Green) sub-task. Status markers: `[ ]` = pending, `[~]` = in progress, `[x]` = done (with commit SHA).
 
-## Phase 1: Fused motionStillness metric
+## Phase 1: Fused motionStillness metric `[checkpoint: 7a48495]`
 
 - [x] Task: Add `motionStillness` metric and maintenance `2e35848`
     - [x] Write tests: `tests/sr-ekf.test.ts` — motionStillness driven by `smoothedSpeed` when GPS fresh (cruise ⇒ low, stop ⇒ high); falls back to filter `v`/device-stillness proxy when GPS stale (coasting); smooth ramp, no hard binary. `2e35848`
