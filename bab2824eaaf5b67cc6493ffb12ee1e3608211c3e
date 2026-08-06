@@ -1,0 +1,16 @@
+Phase 1 Completion Verification Report
+
+Automated Test Command: npx vitest run
+Result: 118/118 tests passed; npx tsc BUILD_OK
+
+Phase 1 Tasks:
+- [x] Update velocity prior gate + rest-weighted H block (9769981)
+
+Manual Verification Steps confirmed by user (yes):
+1. Full test suite: 118/118 pass
+2. Typecheck: BUILD_OK
+3. Two gates verified: velocity prior (motionStillness < 0.5 + !_zuptEngaged),
+   rest-weighted H (motionStillness > 0.5)
+4. Coasting test passes (v > 7 after 12s tunnel cruise)
+
+User Confirmation: yes
