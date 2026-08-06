@@ -1,0 +1,16 @@
+Phase 1 Task 2: Extract RingBuf into src/ring-buf.ts
+
+Red: wrote tests/ring-buf.test.ts with 7 unit tests covering push,
+shift, get, wrap-around, clear, and capacity.
+
+Green: created src/ring-buf.ts with the RingBuf class extracted from
+sr-ekf.ts. Imported into sr-ekf.ts. Fixed a latent bug in shift() —
+the original code decremented length before computing the oldest-element
+index, returning the wrong value. Callers (updateImuWindow,
+updateStepDetection) ignored the return value so the bug had no
+behavioral impact. Fixed by computing the index before decrementing.
+
+Files: created src/ring-buf.ts, tests/ring-buf.test.ts; modified
+src/sr-ekf.ts.
+
+Verification: npx tsc BUILD_OK; 103/103 tests pass.
