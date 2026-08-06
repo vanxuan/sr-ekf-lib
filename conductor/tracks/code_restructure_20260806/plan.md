@@ -2,7 +2,7 @@
 
 > Workflow: Test-Driven Development. Every feature task is split into a "Write Tests" (Red) sub-task followed by an "Implement Feature" (Green) sub-task. Status markers: `[ ]` = pending, `[~]` = in progress, `[x]` = done (with commit SHA).
 
-## Phase 1: Extract pure infrastructure (math, RingBuf, config)
+## Phase 1: Extract pure infrastructure (math, RingBuf, config) `[checkpoint: e915fb5]`
 
 - [x] Task: Extract matrix/QR math into `src/math.ts`
     - [x] Write tests: `tests/math.test.ts` — 6 unit tests for `qrInPlace`, `wrapAngle`, `ensureDiag`, `chol4x4`+`cholSolve4`, `matLowerToFull`, `traceOfP`.
@@ -13,7 +13,7 @@
 - [x] Task: Extract config types, defaults, and constants into `src/config.ts`
     - [x] Write tests: n/a (types/constants — implicitly tested by existing suite).
     - [x] Implement: Created `src/config.ts` with `EkfConfig`, defaults, `I` (as const object), `N`/`M`/`PRE`/`MAG_PRE`/`NTRI`, `DEFAULTS`, `EPS`, all motion constants. Re-exported types from `sr-ekf.ts` for downstream consumers.
-- [ ] Task: Conductor - User Manual Verification 'Phase 1' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Phase 1' (Protocol in workflow.md): user confirmed yes; verification report attached to checkpoint `e915fb5`.
 
 ## Phase 2: Extract pure-domain logic (CTRA kinematics, diagnostics)
 
