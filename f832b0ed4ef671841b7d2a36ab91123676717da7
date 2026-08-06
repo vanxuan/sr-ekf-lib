@@ -1,0 +1,13 @@
+Phase 3 Completion Verification Report
+
+Automated Test Command: npx vitest run
+Result: 90/90 tests passed (81 sr-ekf.test.ts + 9 qr-verification.test.ts); npx tsc BUILD_OK
+
+Phase 3 Tasks:
+- [x] Verify device-domain consumers unchanged (ZUPT, mag, ZARU, omegaScale all cleanly separated)
+- [x] Update AGENTS.md and README (added Fused Motion Stillness section, consumer routing table, synced all stale references, test counts to 90)
+- [x] Conductor verification (user confirmed yes)
+
+Manual Verification confirmed: full suite passes, typecheck clean, docs updated.
+
+Track 'motion_stillness_20260806' is complete.
