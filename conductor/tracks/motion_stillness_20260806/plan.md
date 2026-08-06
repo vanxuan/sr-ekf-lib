@@ -26,7 +26,7 @@
 - [x] Task: Diagnostics `stationary` uses motionStillness (finalize) `a6bda78`
     - [x] Write tests: new test pins `stationary=false` when v=3.5 contradicts the metric (|v| gate clause); existing stop/cruise tests updated for the restored speed gate. `a6bda78`
     - [x] Implement: `stationary = motionStillness > 0.7 && Math.abs(v) < 3.0`; matches documented AGENTS.md contract; getDebug()/getImuStats() unchanged. `a6bda78`
-- [ ] Task: Conductor - User Manual Verification 'Phase 2' (Protocol in workflow.md)
+- [~] Task: Conductor - User Manual Verification 'Phase 2' (Protocol in workflow.md)
 
 ## Phase 3: Device-domain regression hardening and docs
 
