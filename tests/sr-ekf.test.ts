@@ -524,6 +524,68 @@ describe('SrEkf', () => {
     expect(d.stationary).toBe(true)
   })
 
+  it('should engage ZUPT for a hand-held phone at a stop (high device variance, GPS speed 0)', () => {
+    // A hand-held phone at a red light has high IMU variance (device stillness
+    // near 0) even though the VEHICLE is stopped. ZUPT must key on the fused
+    // motionStillness (driven by GPS speed ≈ 0) so it engages anyway and learns
+    // the accel bias — not on raw device stillness, which would block it.
+    const ekf = new SrEkf({
+      processNoise: { accelBias: 1e-4 }
+    })
+    ekf.reset(0, 0, 3, 0)
+    ekf.updateGps(0, 0, 0, 0, 0) // GPS init at rest (speed 0)
+    // hand tremor: large zero-mean jitter on the VERTICAL axis (device variance
+    // kills device-stillness) while forward ax stays smooth so bias is learnable
+    let rnd = 12345
+    const rnd01 = () => { rnd = (rnd * 1103515245 + 12345) & 0x7fffffff; return rnd / 0x7fffffff }
+    const bias = 0.06
+    for (let i = 1; i <= 1000; i++) {
+      const jitter = (rnd01() + rnd01() + rnd01() + rnd01() - 2) / 2 * 1.6 // ±1.6 m/s² vertical
+      ekf.predict(bias, 0, 0, 0.01, i, jitter)
+      ekf.updateGps(0, 0, 0, 0, i)
+    }
+    expect(ekf.getStillness()).toBeLessThan(0.15) // device is definitely not still
+    const s = ekf.getState()
+    expect(s.v).toBeLessThan(0.2)                              // ZUPT holds velocity at zero
+    expect(Math.abs(s.aBiasX - bias)).toBeLessThan(0.06)       // bias learned via ZUPT
+    expect(ekf.getDiagnostics().stationary).toBe(true)
+  })
+
+  it('should NOT engage ZUPT for a mounted phone cruising (device-still, GPS speed high)', () => {
+    // Smooth mounted cruise: device stillness ≈ 1 but GPS confirms 10 m/s, so
+    // motionStillness is low and ZUPT must stay off — the velocity domain wins.
+    const ekf = new SrEkf()
+    ekf.reset(0, 0, 10, 0)
+    ekf.updateGps(0, 0, 10, 0, 0) // GPS init cruising at 10 m/s
+    for (let i = 1; i <= 200; i++) {
+      ekf.predict(0, 0, 0, 0.01, i) // zero IMU variance → device-still ≈ 1
+      ekf.updateGps(0, 10 * 0.01 * i, 10, 0, i)
+    }
+    expect(ekf.getStillness()).toBeGreaterThan(0.7) // device physically still
+    expect(ekf.getDiagnostics().motionStillness).toBeLessThan(0.1)
+    expect(ekf.getState().v).toBeGreaterThan(9.5) // ZUPT must NOT drag velocity down
+  })
+
+  it('should engage ZUPT for a tilted mount at a stop (constant forward ax, zero variance)', () => {
+    // A phone in a tilted mount reads a CONSTANT forward accel (gravity
+    // projection, e.g. 1.5 m/s²). Constant ax is indistinguishable from a bias
+    // and must NOT read as device-motion evidence — ZUPT must engage and learn
+    // it as aBiasX, holding v at zero. (This is why the device evidence is
+    // variance-gated: a tilted mount has zero ax variance.)
+    const ekf = new SrEkf()
+    ekf.reset(0, 0, 2, 0)
+    ekf.updateGps(0, 0, 0, 0, 0) // GPS init at rest (speed 0)
+    const gravityAx = 1.5
+    for (let i = 1; i <= 600; i++) {
+      ekf.predict(gravityAx, 0, 0, 0.01, i)
+      ekf.updateGps(0, 0, 0, 0, i)
+    }
+    const s = ekf.getState()
+    expect(s.v).toBeLessThan(0.2)                       // ZUPT holds velocity at zero
+    expect(s.aBiasX).toBeGreaterThan(gravityAx - 0.3)   // gravity projection learned as bias
+    expect(ekf.getDiagnostics().stationary).toBe(true)
+  })
+
   it('should converge heading from magnetometer updates', () => {
     const ekf = new SrEkf({ measurementNoise: { heading: 0.1 } })
     ekf.reset(0, 0, 5, Math.PI)

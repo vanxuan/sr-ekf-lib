@@ -58,6 +58,35 @@ const EPS = 1e-4, TWO_PI = 2 * Math.PI;
 // replaces the old hard `gpsMoving = lastGpsSpeed > 2.0` ZUPT binary.
 const MOTION_V_CUT = 1.0;
 const GPS_REST_NOISE = 1.0;
+// Filter-velocity evidence scale used only when GPS is stale (coasting). The
+// fresh branch trusts GPS speed (full ramp by ~2 m/s), but a device-still phone
+// with a stale/corrupted filter v must still read as "still" so ZUPT can recover
+// it (the documented corrupted-v envelope extends to ~6–7 m/s, where the ZUPT
+// speedGate — which cuts at 8 m/s — is the real guard). A wide 9 m/s cutoff
+// keeps v ≈ 10 (mounted cruise in a tunnel) at motionStillness 0 while letting
+// device-still v ≈ 6 read as still.
+const MOTION_V_CUT_STALE = 9.0;
+// Sustained device-motion evidence scale. Walking and a green-light start
+// excite the FORWARD axis (window variance of raw ax/ay, bias-invariant) plus
+// gyro energy; a hand-held phone at a red light has mostly vertical tremor
+// (excluded from the forward-axis evidence) and a tilted mount has CONSTANT ax
+// (zero variance), so neither falsely blocks ZUPT. The variance evidence is
+// normalized by 5 m/s² and scaled so walking (√varAx ≈ 1.4, ≈ 0.28 after
+// normalization) drives motionStillness to 0.
+const DEVICE_VAR_SCALE = 8.0;
+// Gyro energy (mean ‖ω‖², rad²/s²) adds device-motion evidence: turning the
+// device in hand at a stop rotates the phone without moving the vehicle. At a
+// real rest rotation (~0.3 rad/s → energy 0.09) the contribution is small
+// (0.045 → motionStillness ≈ 0.64, ZUPT stays on); fast manipulation
+// (~2 rad/s → energy 4 → evidence 2) drops it to 0, disengaging ZUPT.
+const DEVICE_GYRO_SCALE = 0.5;
+// Raw |ax| only counts as motion evidence while the forward axis is actually
+// ACTIVE (window variance above this floor). A tilted mount or a learned
+// accel-bias error reads a CONSTANT forward ax — zero variance — which must
+// never block ZUPT (that would prevent the very bias re-learning ZUPT exists
+// for). Real walking / a green-light start excite the forward axis and so pass
+// the gate immediately.
+const DEVICE_ACTIVITY_FLOOR = 0.01;
 
 import { matCreate, matLowerToFull, matLowerToFullInto, chol4x4, cholSolve4, ensureDiag } from './matrix';
 
@@ -109,6 +138,7 @@ export class SrEkf {
   private coasting = false;
   private gpsInitialized = false;
   private accelEnergy = 0;
+  private _lastRawAx = 0;
   private gyroEnergy = 0;
   private varAccelEnergy = 0;
   private varGyroEnergy = 0;
@@ -424,6 +454,7 @@ export class SrEkf {
     }
     const a = ax - this.x[I.A_BIAS_X];
     const omega = gz - this.x[I.G_BIAS_Z];
+    this._lastRawAx = Math.abs(ax);
     const oldOmega = this.prevOmega;
     const psi = this.x[I.PSI], beta = this.x[I.BETA], v = this.x[I.V];
     const absV = Math.abs(v), absOmega = Math.abs(omega);
@@ -497,37 +528,32 @@ export class SrEkf {
       this.applyLateralAccel(ay, omega);
     else if (absOmega < 0.1 && absV > 0.15)
       this.applyNonholonomic(omega);
-    // ZUPT engages when the IMU acceleration is CONSTANT (low variance): a
-    // stationary device reads a constant ax = sensor bias + gravity projection,
-    // which must be learned as aBiasX. A genuine (varying) acceleration has high
-    // ax variance and correctly excludes ZUPT. The speed gate protects genuine
-    // constant-velocity motion (which IMU alone cannot distinguish from rest):
-    // ZUPT is disabled above ~3 m/s, so a cruising vehicle keeps its velocity.
-    // The low-variance (constant-ax) gate lets ZUPT fire during the low-speed
-    // approach and LEARN the bias BEFORE v escapes past the speed gate — this is
-    // what prevents a constant bias from integrating into a runaway straight-line
-    // drift (the reported "car icon moves on a line" symptom). Note: the old
-    // velocityStillness ramp (cutoff at |v|=0.15) was removed — it killed ZUPT
-    // after a single step, before the bias could be learned, and let v diverge.
-    // ZUPT — dual-threshold hysteresis (ON=0.15, OFF=0.05) prevents chatter at
-    // the boundary. Chi-square innovation gate rejects velocity innovations that
-    // are statistically inconsistent with zero-velocity hypothesis (3σ).
+    // ZUPT engages when the VEHICLE is not moving — keyed on the fused
+    // motionStillness (GPS speed ≈ 0, or filter v + device-stillness proxy when
+    // GPS is stale). This is deliberate: a hand-held phone at a red light has
+    // high IMU variance (device stillness ≈ 0) yet the vehicle is stopped, so
+    // ZUPT must still engage to hold v = 0 and learn the accel bias. Conversely
+    // a mounted phone cruising at 10 m/s is device-still but GPS-confirmed
+    // moving, so ZUPT stays off. The speed gate adds a hard cutoff above 8 m/s
+    // so a cruising vehicle (IMU alone cannot distinguish constant cruise from
+    // rest) keeps its velocity. Chi-square innovation gate rejects velocity
+    // innovations that are statistically inconsistent with the zero-velocity
+    // hypothesis (3σ).
     const speedGate = Math.min(Math.max((8.0 - Math.abs(this.x[I.V])) / 4.0, 0), 1);
-    const gpsMoving = this.lastGpsSpeed > 2.0;
-    const zuptWeight = stillness * speedGate;
+    const zuptWeight = this.motionStillness * speedGate;
     this._zuptWeight = zuptWeight;
     this._speedGate = speedGate;
     this._accelGate = 0;
 
     const ZUPT_ON = 0.15, ZUPT_OFF = 0.05;
     if (!this._zuptEngaged) {
-      if (!gpsMoving && zuptWeight >= ZUPT_ON && this.axWindow.length >= 5 && this.zuptChiSqGate()) {
+      if (zuptWeight >= ZUPT_ON && this.axWindow.length >= 5 && this.zuptChiSqGate()) {
         this.applyZupt(zuptWeight, omega);
         this._zuptEngaged = true;
         this._wasZuptEngaged = true;
       }
     } else {
-      if (gpsMoving || zuptWeight < ZUPT_OFF) {
+      if (zuptWeight < ZUPT_OFF) {
         this._zuptEngaged = false;
       } else if (this.zuptChiSqGate()) {
         this.applyZupt(zuptWeight, omega);
@@ -626,7 +652,7 @@ export class SrEkf {
       this.x[I.Y] = y;
       const spd = Math.sqrt(vx * vx + vy * vy);
       this.lastGpsSpeed = spd;
-      this.smoothedSpeed = undefined;
+      this.smoothedSpeed = spd;
       if (spd > 0.1) {
         this.x[I.V] = spd;
         this.x[I.PSI] = this.wrapAngle(Math.atan2(vy, vx));
@@ -1414,18 +1440,33 @@ if (absOmega > EPS) {
     // Fused motion stillness ∈ [0,1]: 1 = vehicle velocity ≈ 0, 0 = in motion.
     // GPS fresh: driven by smoothedSpeed (the 3s EMA hybrid) minus the GPS
     // velocity rest-noise floor — a real stop reports GPS jitter, which must
-    // not read as motion. GPS stale (coasting): fall back to filter v, then to
-    // device stillness as a one-way proxy (a still device suggests a stopped
-    // vehicle; a jiggly device is ambiguous and does not force motion).
+    // not read as motion. GPS stale (coasting): fall back to filter v (scaled
+    // by MOTION_V_CUT_STALE so a device-still corrupted v up to ~6 m/s still
+    // reads as still and ZUPT can recover it), then to device stillness as a
+    // one-way proxy (a still device suggests a stopped vehicle; a jiggly
+    // device is ambiguous and does not force motion).
+    // In BOTH branches, device-motion evidence adds to the velocity evidence.
+    // It is bias-INVARIANT: it uses raw forward-axis window variance (a tilted
+    // mount or a learned accel-bias error produce CONSTANT ax → zero variance
+    // → no false "device motion" at a real stop), and raw |ax| counts only
+    // while the forward axis is active (variance above DEVICE_ACTIVITY_FLOOR).
+    // A hand-held phone at a red light has mostly VERTICAL tremor (az, excluded
+    // from this forward-axis evidence), so ZUPT stays engaged; walking and a
+    // green-light start excite the forward axis immediately, dropping the metric
+    // so ZUPT disengages on real motion even while GPS is frozen at 0.
+    const accelVarEvidence = Math.sqrt(Math.max(this._varAx + this._varAy, 0)) / 5;
+    const gyroEvidence = this._gyro3DEnergy * DEVICE_GYRO_SCALE;
+    const forwardActive = this._varAx + this._varAy > DEVICE_ACTIVITY_FLOOR;
+    const rawAxEvidence = forwardActive ? this._lastRawAx / 5 : 0;
+    const deviceMotion = Math.max(accelVarEvidence, rawAxEvidence, gyroEvidence) * DEVICE_VAR_SCALE;
     let speedEvidence: number;
     if (!this.coasting && this.smoothedSpeed !== undefined) {
       speedEvidence = Math.max(0, this.smoothedSpeed - GPS_REST_NOISE);
     } else {
       const deviceStillness = this.getStillness();
-      const deviceBlend = (1 - deviceStillness) * MOTION_V_CUT;
-      speedEvidence = Math.max(Math.abs(this.x[I.V]), deviceBlend);
+      speedEvidence = Math.max(Math.abs(this.x[I.V]) / MOTION_V_CUT_STALE, 1 - deviceStillness);
     }
-    this.motionStillness = Math.min(Math.max(1 - speedEvidence / MOTION_V_CUT, 0), 1);
+    this.motionStillness = Math.min(Math.max(1 - Math.max(speedEvidence, deviceMotion), 0), 1);
   }
 
   private zuptChiSqGate(): boolean {
