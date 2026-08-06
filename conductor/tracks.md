@@ -4,5 +4,5 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-- [ ] **Track: Separate device stillness from motion stillness: introduce a fused motionStillness metric and route velocity-domain consumers (ZUPT, coasting velocity damping, GPS stationaryWeight, diagnostics) to it, keeping device stillness for device-domain logic (mag adaptive noise, rest-rotation omegaScale)**
+- [~] **Track: Separate device stillness from motion stillness: introduce a fused motionStillness metric and route velocity-domain consumers (ZUPT, coasting velocity damping, GPS stationaryWeight, diagnostics) to it, keeping device stillness for device-domain logic (mag adaptive noise, rest-rotation omegaScale)**
   *Link: [./tracks/motion_stillness_20260806/](./tracks/motion_stillness_20260806/)*

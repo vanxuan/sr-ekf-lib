@@ -10,7 +10,7 @@
 - [x] Task: Expose `motionStillness` and update `stationary` diagnostic `2e35848`
     - [x] Write tests: `getDiagnostics().motionStillness` present and consistent; `stationary` follows motionStillness (hand-held-at-stop ⇒ true; mounted-cruise ⇒ false). `2e35848`
     - [x] Implement: add `motionStillness` to `EkfDiagnostics`; rewire `stationary = motionStillness > 0.7`. `2e35848`
-- [ ] Task: Conductor - User Manual Verification 'Phase 1' (Protocol in workflow.md)
+- [~] Task: Conductor - User Manual Verification 'Phase 1' (Protocol in workflow.md)
 
 ## Phase 2: Route velocity-domain consumers to motionStillness
 
