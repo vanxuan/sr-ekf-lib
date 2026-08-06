@@ -1064,7 +1064,7 @@ export class SrEkf {
       gpsInnovation: this._innovCache,
       gpsChiSq: this.lastChiSq, gatePassed: this.lastGatePassed,
       coasting: this.coasting, lastGpsTimeMs: this.lastGpsTimeMs,
-      lastImuTimeMs: this.lastImuTimeMs, stationary: this.motionStillness > 0.7, motionStillness: this.motionStillness,
+      lastImuTimeMs: this.lastImuTimeMs, stationary: this.motionStillness > 0.7 && Math.abs(this.x[I.V]) < 3.0, motionStillness: this.motionStillness,
       magDeclination: this.x[I.MAG_DECL], robustWeight: this.robustWeight, adaNoiseScale: this.adaNoiseScale
     };
   }

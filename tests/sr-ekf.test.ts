@@ -471,6 +471,15 @@ describe('SrEkf', () => {
       ekf.predict(0, 0, 0, 0.05, i)
       ekf.updateGps(0, py, spd, 0, i)
     }
+    // hold at rest until the velocity state converges below the stationary gate:
+    // EkfDiagnostics.stationary = motionStillness > 0.7 AND |v| < 3.0 — right
+    // after a hard stop the filter v still reads ~3 m/s (velocity updates are
+    // zero-blended + velR-inflated at the stop), so stationary only flips true
+    // once ZUPT/position pull v below 3.
+    for (let i = 61; i <= 200; i++) {
+      ekf.predict(0, 0, 0, 0.05, i)
+      ekf.updateGps(0, py, 0, 0, i)
+    }
     const stop = ekf.getDiagnostics()
     expect(stop.motionStillness).toBeGreaterThan(0.8)
     expect(stop.stationary).toBe(true)
@@ -522,6 +531,19 @@ describe('SrEkf', () => {
     expect(ekf.getStillness()).toBeGreaterThan(0.7) // device physically still
     expect(d.motionStillness).toBeGreaterThan(0.7)  // proxy keeps metric high
     expect(d.stationary).toBe(true)
+  })
+
+  it('should report stationary=false when filter velocity contradicts the metric (|v| >= 3 speed gate)', () => {
+    // EkfDiagnostics.stationary is documented as "motionStillness > 0.7 AND
+    // |v| < 3.0 (matches ZUPT engagement)" — the velocity gate is a hard part of
+    // the contract. A re-hydrated/reset filter with v = 3.5 while GPS reports a
+    // stop (metric → 1) must NOT report stationary: the velocity state says the
+    // vehicle is still moving. Regression guard for the finalize of the wiring.
+    const ekf = new SrEkf()
+    ekf.reset(0, 0, 3.5, 0)
+    ekf.updateGps(0, 0, 0, 0, 0) // GPS init at rest (speed 0) — metric → 1, v untouched
+    expect(ekf.getDiagnostics().motionStillness).toBeGreaterThan(0.9)
+    expect(ekf.getDiagnostics().stationary).toBe(false)
   })
 
   it('should engage ZUPT for a hand-held phone at a stop (high device variance, GPS speed 0)', () => {
