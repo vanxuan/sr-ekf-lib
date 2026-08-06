@@ -1,0 +1,8 @@
+{
+  "track_id": "motion_stillness_20260806",
+  "type": "feature",
+  "status": "new",
+  "created_at": "2026-08-06T15:03:03Z",
+  "updated_at": "2026-08-06T15:03:03Z",
+  "description": "Separate device stillness from motion stillness: introduce a fused motionStillness metric and route velocity-domain consumers (ZUPT, coasting velocity damping, GPS stationaryWeight, diagnostics) to it, keeping device stillness for device-domain logic (mag adaptive noise, rest-rotation omegaScale)"
+}
