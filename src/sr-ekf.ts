@@ -33,7 +33,7 @@ export interface NavigationSolution {
 export interface EkfDiagnostics {
   trace: number; gpsInnovation: Float64Array; gpsChiSq: number
   gatePassed: boolean; coasting: boolean; lastGpsTimeMs: number
-  lastImuTimeMs: number; stationary: boolean; magDeclination: number
+  lastImuTimeMs: number; stationary: boolean; motionStillness: number; magDeclination: number
   robustWeight: number; adaNoiseScale: number
 }
 
@@ -51,6 +51,13 @@ const DEFAULTS = {
 };
 
 const EPS = 1e-4, TWO_PI = 2 * Math.PI;
+// Fused motion-stillness ramp: motionStillness = clamp(1 − speedEvidence / vCut).
+// GPS velocity at a real stop still reports jitter (typically up to ~1 m/s on
+// phone IMU/GPS), so speeds at or below GPS_REST_NOISE read as fully still and
+// speeds above it ramp to 0 at vCut above the noise floor. This smoothly
+// replaces the old hard `gpsMoving = lastGpsSpeed > 2.0` ZUPT binary.
+const MOTION_V_CUT = 1.0;
+const GPS_REST_NOISE = 1.0;
 
 import { matCreate, matLowerToFull, matLowerToFullInto, chol4x4, cholSolve4, ensureDiag } from './matrix';
 
@@ -106,6 +113,7 @@ export class SrEkf {
   private varAccelEnergy = 0;
   private varGyroEnergy = 0;
   private stepEnergy = 0;
+  private motionStillness = 1;
   private _accel3DVar = 0;
   private _gyro3DEnergy = 0;
   private magRejectCount = 0;
@@ -441,6 +449,7 @@ export class SrEkf {
     this.updateStepDetection(ax, timestampMs);
     this.computeAdaptiveQ(dt, a, omega);
     const stillness = this.getStillness();
+    this.updateMotionStillness();
 
     // Sideslip time constant: shorter during angular transients (corner entry/exit)
     // so β tracks the rapidly changing slip angle instead of lagging and corrupting ψ.
@@ -648,6 +657,7 @@ export class SrEkf {
         for (let j = 0; j <= i; j++) { const v = this.S[i][j]; tr += v * v; }
       }
       this._traceCache = tr;
+      this.motionStillness = Math.min(Math.max(1 - Math.max(0, spd - GPS_REST_NOISE) / MOTION_V_CUT, 0), 1);
       return true;
     }
 
@@ -813,6 +823,8 @@ export class SrEkf {
     this.S[I.PSI][I.X] *= (1 - w);
     this.S[I.PSI][I.Y] *= (1 - w);
     this.S[I.PSI][I.V] *= (1 - w);
+
+    this.updateMotionStillness();
 
     const ok = this.gpsUpdateSingle(posR, velR);
     let result = ok;
@@ -1008,7 +1020,7 @@ export class SrEkf {
       gpsInnovation: this._innovCache,
       gpsChiSq: this.lastChiSq, gatePassed: this.lastGatePassed,
       coasting: this.coasting, lastGpsTimeMs: this.lastGpsTimeMs,
-      lastImuTimeMs: this.lastImuTimeMs, stationary: this.getStillness() > 0.7 && Math.abs(this.x[I.V]) < 3.0,
+      lastImuTimeMs: this.lastImuTimeMs, stationary: this.motionStillness > 0.7, motionStillness: this.motionStillness,
       magDeclination: this.x[I.MAG_DECL], robustWeight: this.robustWeight, adaNoiseScale: this.adaNoiseScale
     };
   }
@@ -1396,6 +1408,24 @@ if (absOmega > EPS) {
     if (this.axWindow.length < 5) return 0.5;
     const T_a = 0.3, T_w = 0.05;
     return Math.exp(-(this._accel3DVar / (T_a * T_a) + this._gyro3DEnergy / (T_w * T_w)));
+  }
+
+  private updateMotionStillness(): void {
+    // Fused motion stillness ∈ [0,1]: 1 = vehicle velocity ≈ 0, 0 = in motion.
+    // GPS fresh: driven by smoothedSpeed (the 3s EMA hybrid) minus the GPS
+    // velocity rest-noise floor — a real stop reports GPS jitter, which must
+    // not read as motion. GPS stale (coasting): fall back to filter v, then to
+    // device stillness as a one-way proxy (a still device suggests a stopped
+    // vehicle; a jiggly device is ambiguous and does not force motion).
+    let speedEvidence: number;
+    if (!this.coasting && this.smoothedSpeed !== undefined) {
+      speedEvidence = Math.max(0, this.smoothedSpeed - GPS_REST_NOISE);
+    } else {
+      const deviceStillness = this.getStillness();
+      const deviceBlend = (1 - deviceStillness) * MOTION_V_CUT;
+      speedEvidence = Math.max(Math.abs(this.x[I.V]), deviceBlend);
+    }
+    this.motionStillness = Math.min(Math.max(1 - speedEvidence / MOTION_V_CUT, 0), 1);
   }
 
   private zuptChiSqGate(): boolean {

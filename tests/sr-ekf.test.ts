@@ -445,6 +445,85 @@ describe('SrEkf', () => {
     expect(d.stationary).toBe(false)
   })
 
+  // ─── Tier 2: Fused motionStillness metric ─────────────────────
+
+  it('should expose motionStillness driven by GPS speed when GPS is fresh', () => {
+    const ekf = new SrEkf()
+    ekf.reset(0, 0, 0, 0)
+    // init at rest
+    ekf.updateGps(0, 0, 0, 0, 0)
+    expect(ekf.getDiagnostics().motionStillness).toBeGreaterThan(0.9)
+    // accelerate smoothly to cruise, then cruise at 10 m/s
+    let py = 0, spd = 0
+    for (let i = 1; i <= 20; i++) {
+      spd = Math.min(10, spd + 1) // 0 → 10 m/s
+      py += spd * 0.05
+      ekf.predict(0, 0, 0, 0.05, i)
+      ekf.updateGps(0, py, spd, 0, i)
+    }
+    const cruise = ekf.getDiagnostics()
+    expect(cruise.motionStillness).toBeLessThan(0.1)
+    expect(cruise.stationary).toBe(false)
+    // decelerate smoothly to a stop (GPS velocity tracks), then stay stopped
+    for (let i = 21; i <= 60; i++) {
+      spd = Math.max(0, spd - 0.5) // 10 → 0 m/s over 1s
+      py += spd * 0.05
+      ekf.predict(0, 0, 0, 0.05, i)
+      ekf.updateGps(0, py, spd, 0, i)
+    }
+    const stop = ekf.getDiagnostics()
+    expect(stop.motionStillness).toBeGreaterThan(0.8)
+    expect(stop.stationary).toBe(true)
+  })
+
+  it('should treat GPS speed at or below the rest noise floor as still and ramp smoothly above it', () => {
+    const ekf = new SrEkf()
+    ekf.reset(0, 0, 0, 0)
+    ekf.updateGps(0, 0, 0, 0, 0) // init at rest
+    // sub-noise-floor GPS speed (typical rest jitter) → still
+    for (let i = 1; i <= 5; i++) {
+      ekf.predict(0, 0, 0, 0.05, i)
+      ekf.updateGps(0, 0.4 * 0.05 * i, 0.4, 0, i)
+    }
+    expect(ekf.getDiagnostics().motionStillness).toBeGreaterThan(0.7)
+    // intermediate speed → smooth ramp (strictly between 0 and 1, no hard binary)
+    for (let i = 6; i <= 13; i++) {
+      ekf.predict(0, 0, 0, 0.05, i)
+      ekf.updateGps(0, 1.5 * 0.05 * i, 1.5, 0, i)
+    }
+    const ms = ekf.getDiagnostics().motionStillness
+    expect(ms).toBeGreaterThan(0.1)
+    expect(ms).toBeLessThan(0.9)
+  })
+
+  it('should fall back to filter velocity when GPS is stale (coasting)', () => {
+    const ekf = new SrEkf()
+    ekf.reset(0, 0, 0, 0)
+    ekf.updateGps(0, 0, 10, 0, 0) // init cruising at 10 m/s
+    // warm up the IMU window so device stillness is meaningful
+    for (let i = 1; i <= 60; i++) ekf.predict(0, 0, 0, 0.02, i)
+    // enter coasting (GPS lost)
+    expect(ekf.coast(5000, 6000)).toBe(true)
+    for (let i = 601; i <= 660; i++) ekf.predict(0, 0, 0, 0.02, i)
+    const d = ekf.getDiagnostics()
+    expect(d.coasting).toBe(true)
+    // filter v ≈ coastSpeed (10) → motionStillness stays low even though the
+    // device is physically still (mounted cruise in a tunnel)
+    expect(d.motionStillness).toBeLessThan(0.1)
+    expect(d.stationary).toBe(false)
+  })
+
+  it('should use device stillness as a proxy when GPS is stale and filter v is small', () => {
+    const ekf = new SrEkf()
+    ekf.reset(0, 0, 0, 0)
+    // no GPS at all: GPS-stale branch, filter v = 0, device at rest (zero IMU)
+    for (let i = 0; i < 60; i++) ekf.predict(0, 0, 0, 0.02, i)
+    const d = ekf.getDiagnostics()
+    expect(ekf.getStillness()).toBeGreaterThan(0.7) // device physically still
+    expect(d.motionStillness).toBeGreaterThan(0.7)  // proxy keeps metric high
+    expect(d.stationary).toBe(true)
+  })
+
   it('should converge heading from magnetometer updates', () => {
     const ekf = new SrEkf({ measurementNoise: { heading: 0.1 } })
     ekf.reset(0, 0, 5, Math.PI)
