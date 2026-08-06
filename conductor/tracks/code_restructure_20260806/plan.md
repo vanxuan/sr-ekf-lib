@@ -17,9 +17,9 @@
 
 ## Phase 2: Extract pure-domain logic (CTRA kinematics, diagnostics)
 
-- [ ] Task: Extract CTRA kinematics into `src/ctra.ts`
-    - [ ] Write tests: `tests/ctra.test.ts` — unit tests for `ctraDelta()` (big-ω and small-ω branches, zero-ω edge), Jacobian computation (verify Jacobian entries against finite differences), adaptive-Q formula.
-    - [ ] Implement: Create `src/ctra.ts` with `ctraDelta()`, `computeJacobian()`, `computeAdaptiveQ()`, process-noise helpers; import in `sr-ekf.ts`; remove inline definitions. All predict-dependent tests pass unchanged.
+- [x] Task: Extract CTRA kinematics into `src/ctra.ts`
+    - [x] Write tests: `tests/ctra.test.ts` — 7 unit tests for `ctraDelta()` (big-ω, small-ω, zero-psi branches) and `computeJacobian()` (diagonal, position-velocity, gyro-bias derivatives, beta decay).
+    - [x] Implement: Created `src/ctra.ts` with exported `ctraDelta()` (pure) and `computeJacobian()` (takes state + `F` output array). `computeAdaptiveQ()` kept in `sr-ekf.ts` due to deep state coupling. Updated call sites; removed private methods. All predict-dependent tests pass unchanged (110 tests).
 - [ ] Task: Extract diagnostic readouts into `src/diagnostics.ts`
     - [ ] Write tests: `tests/diagnostics.test.ts` — unit tests for diagnostic formatting, debug-snapshot correctness.
     - [ ] Implement: Create `src/diagnostics.ts` with `buildDiagnostics()`, `buildDebug()`, `buildImuStats()`; import in `sr-ekf.ts`; remove inline definitions. All diagnostic tests pass unchanged.
