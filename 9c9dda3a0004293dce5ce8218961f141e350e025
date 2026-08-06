@@ -1,0 +1,14 @@
+Phase 2 Task 2: Extract diagnostic readouts into src/diagnostics.ts
+
+Red: wrote tests/diagnostics.test.ts with 8 unit tests for wmean,
+wstd, buildDiagnostics, buildDebug, buildImuStats.
+
+Green: created src/diagnostics.ts with pure snapshot-formatting
+functions. Updated getDiagnostics(), getDebug(), getImuStats() in
+sr-ekf.ts to delegate to the imported functions. Removed local wmean
+and wstd definitions.
+
+Files: created src/diagnostics.ts, tests/diagnostics.test.ts; modified
+src/sr-ekf.ts.
+
+Verification: npx tsc BUILD_OK; 118/118 tests pass.
