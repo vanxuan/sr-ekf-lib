@@ -6,6 +6,7 @@ import { matCreate, matLowerToFull, matLowerToFullInto, chol4x4, cholSolve4, ens
 
 import { RingBuf } from './ring-buf';
 import { ctraDelta, computeJacobian } from './ctra';
+import { buildDiagnostics, buildDebug, buildImuStats } from './diagnostics';
 
 export class SrEkf {
   private readonly x = new Float64Array(N);
@@ -887,22 +888,13 @@ export class SrEkf {
     magRejectCount: number; magTrust: number; magInnovDeg: number;
     gateThreshDeg: number; magAlpha: number;
   } {
-    return {
-      stillness: this.getStillness(),
-      aBiasX: this.x[I.A_BIAS_X],
-      gBiasZ: this.x[I.G_BIAS_Z],
-      v: this.x[I.V],
-      psiDeg: (this.x[I.PSI] * 180) / Math.PI,
-      zuptWeight: this._zuptWeight,
-      speedGate: this._speedGate,
-      accelGate: this._accelGate,
-      n: this.axWindow.length,
-      magRejectCount: this.magRejectCount,
-      magTrust: this._debugMagTrust,
-      magInnovDeg: this._debugInnovDeg,
-      gateThreshDeg: this._debugGateThreshDeg,
-      magAlpha: this._debugMagAlpha,
-    };
+    return buildDebug(
+      this.getStillness(), this.x[I.A_BIAS_X], this.x[I.G_BIAS_Z], this.x[I.V],
+      (this.x[I.PSI] * 180) / Math.PI,
+      this._zuptWeight, this._speedGate, this._accelGate,
+      this.axWindow.length, this.magRejectCount, this._debugMagTrust,
+      this._debugInnovDeg, this._debugGateThreshDeg, this._debugMagAlpha
+    );
   }
 
   /** Debug: bias-corrected mean and std of the 1s IMU windows, for diagnosing
@@ -911,21 +903,7 @@ export class SrEkf {
     n: number; meanAxRel: number; stdAx: number;
     meanGzRel: number; stdGz: number; lastOmega: number;
   } {
-    const wmean = (b: RingBuf): number => {
-      if (b.length === 0) return 0; let s = 0; for (let i = 0; i < b.length; i++) s += b.get(i); return s / b.length;
-    };
-    const wstd = (b: RingBuf, m: number): number => {
-      if (b.length < 2) return 0; let s = 0; for (let i = 0; i < b.length; i++) { const d = b.get(i) - m; s += d * d; } return Math.sqrt(s / b.length);
-    };
-    const mAx = wmean(this.axWindow), mGz = wmean(this.gzWindow);
-    return {
-      n: this.axWindow.length,
-      meanAxRel: mAx - this.x[I.A_BIAS_X],
-      stdAx: wstd(this.axWindow, mAx),
-      meanGzRel: mGz - this.x[I.G_BIAS_Z],
-      stdGz: wstd(this.gzWindow, mGz),
-      lastOmega: this.lastOmega,
-    };
+    return buildImuStats(this.axWindow, this.gzWindow, this.x[I.A_BIAS_X], this.x[I.G_BIAS_Z], this.lastOmega);
   }
 
   getDiagnostics(): EkfDiagnostics {
@@ -933,14 +911,13 @@ export class SrEkf {
     this._innovCache[1] = this.tmpInnov[1];
     this._innovCache[2] = this.tmpInnov[2];
     this._innovCache[3] = this.tmpInnov[3];
-    return {
-      trace: this._traceCache,
-      gpsInnovation: this._innovCache,
-      gpsChiSq: this.lastChiSq, gatePassed: this.lastGatePassed,
-      coasting: this.coasting, lastGpsTimeMs: this.lastGpsTimeMs,
-      lastImuTimeMs: this.lastImuTimeMs, stationary: this.motionStillness > 0.7 && Math.abs(this.x[I.V]) < 3.0, motionStillness: this.motionStillness,
-      magDeclination: this.x[I.MAG_DECL], robustWeight: this.robustWeight, adaNoiseScale: this.adaNoiseScale
-    };
+    return buildDiagnostics(
+      this._traceCache, this._innovCache,
+      this.lastChiSq, this.lastGatePassed, this.coasting,
+      this.lastGpsTimeMs, this.lastImuTimeMs,
+      this.x[I.V], this.motionStillness, this.x[I.MAG_DECL],
+      this.robustWeight, this.adaNoiseScale
+    );
   }
 
   // ─── private helpers ────────────────────────────────────────────
