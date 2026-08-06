@@ -14,9 +14,9 @@
 
 ## Phase 2: Route velocity-domain consumers to motionStillness
 
-- [ ] Task: ZUPT gating keys on motionStillness
-    - [ ] Write tests: hand-held phone at a stop (high device variance, GPS speed ≈ 0) engages ZUPT and learns bias; mounted phone cruising (device-still ≈ 1, GPS speed high) does NOT engage ZUPT; removes reliance on hard `gpsMoving > 2.0`.
-    - [ ] Implement: `zuptWeight = motionStillness × speedGate` in `predict()`; drop the `gpsMoving` binary override in favor of the continuous ramp.
+- [x] Task: ZUPT gating keys on motionStillness `dac402c`
+    - [x] Write tests: hand-held phone at a stop (high device variance, GPS speed ≈ 0) engages ZUPT and learns bias; mounted phone cruising (device-still ≈ 1, GPS speed high) does NOT engage ZUPT; removes reliance on hard `gpsMoving > 2.0`. `dac402c`
+    - [x] Implement: `zuptWeight = motionStillness × speedGate` in `predict()`; drop the `gpsMoving` binary override in favor of the continuous ramp. `dac402c`
 - [ ] Task: Coasting velocity damping keys on motionStillness
     - [ ] Write tests: hand-held stop during coasting (device variance high, filter `v` → 0) still damps velocity to 0; genuine motion during coasting (motionStillness low) preserved.
     - [ ] Implement: coasting `stationarity` gate uses `motionStillness` instead of `accelEnergy + gyroEnergy`.
