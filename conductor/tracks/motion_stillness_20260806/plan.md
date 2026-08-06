@@ -36,7 +36,7 @@
 - [x] Task: Update AGENTS.md and README
     - [x] Write tests: n/a (docs) — full suite green gate (90 tests pass after all editorial changes).
     - [x] Implement: added Fused Motion Stillness section (definition, fresh/stale-branch formulas, device-motion evidence, consumer routing table); updated ZUPT section (weight=ms×speedGate, velR inflation=ms, disengagement without gpsMoving); updated coasting damping (ms>0.5); updated EkfDiagnostics stationary (motionStillness>0.7&&|v|<3.0, added motionStillness field); synced test counts to 90 (81+9). README: same stationary/motionStillness interface updates, test count synced.
-- [ ] Task: Conductor - User Manual Verification 'Phase 3' (Protocol in workflow.md)
+- [~] Task: Conductor - User Manual Verification 'Phase 3' (Protocol in workflow.md)
 
 ## Definition of Done
 
