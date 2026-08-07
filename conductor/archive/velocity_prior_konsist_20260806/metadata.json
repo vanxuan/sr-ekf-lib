@@ -1,8 +1,0 @@
-{
-  "track_id": "velocity_prior_konsist_20260806",
-  "type": "chore",
-  "status": "new",
-  "created_at": "2026-08-06T20:15:00Z",
-  "updated_at": "2026-08-06T20:15:00Z",
-  "description": "Unify velocity prior stationarity gate onto motionStillness (last holdout from motion_stillness track)"
-}
