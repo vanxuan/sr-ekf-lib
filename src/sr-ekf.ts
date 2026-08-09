@@ -21,6 +21,7 @@ export class SrEkf {
   private coasting = false;
   private gpsInitialized = false;
   private accelEnergy = 0;
+  private rawAccelEnergy = 0;
   private _lastRawAx = 0;
   private gyroEnergy = 0;
   private varAccelEnergy = 0;
@@ -374,7 +375,7 @@ export class SrEkf {
       : Math.max(0.5, 1.5 - (absV - 1.5) * (1.0 / 3.5));
     const betaTau = betaTauBase * (1 - 0.6 * angAccelNorm) * (1 - 0.5 * this.stepEnergy);
     const expDt50 = Math.exp(-dt / 50);
-    computeJacobian(this.x[I.PSI] + this.x[I.BETA], this.x[I.V], a, omegaAvg, dt, betaTau, this.accelEnergy < 0.05 ? expDt50 : 1, EPS, this.tmpF);
+    computeJacobian(this.x[I.PSI] + this.x[I.BETA], this.x[I.V], a, omegaAvg, dt, betaTau, this.rawAccelEnergy < 0.05 ? expDt50 : 1, EPS, this.tmpF);
 
     for (let i = 0; i < N; i++)
       for (let j = 0; j < N; j++) {
@@ -404,7 +405,15 @@ export class SrEkf {
     const omegaScale = vehMoving > 0 ? Math.max(vehMoving, stillness) : 1;
     this.x[I.PSI] = wrapAngle(psi + omegaAvg * dt * omegaScale);
     this.x[I.BETA] *= Math.exp(-dt / betaTau);
-    // A_BIAS_X updated only via GPS velocity corrections (no decay needed)
+    // a_bias_x mean-reversion: while the RAW forward axis shows no dynamic
+    // acceleration (rawAccelEnergy < 0.05), drift the bias toward 0 with a 50s
+    // time constant so a wrongly-learned bias (e.g. ZUPT engaged during the
+    // ambiguous creep window right after GPS init) heals instead of being
+    // locked in. computeJacobian's F[A_BIAS_X][A_BIAS_X] = exp(-dt/50) mirrors
+    // this state decay so covariance matches the state dynamics. The gate keys
+    // on the RAW |ax| (not bias-corrected a_forward): at cruise |ax|≈0 even
+    // with a badly wrong bias, so reversion stays ON and pulls it back.
+    if (this.rawAccelEnergy < 0.05) this.x[I.A_BIAS_X] *= expDt50;
 
     if (this.config.useLateralAccel && absOmega > 0.1 && absV > 0.2)
       this.applyLateralAccel(ay, omega);
@@ -422,7 +431,18 @@ export class SrEkf {
     // innovations that are statistically inconsistent with the zero-velocity
     // hypothesis (3σ).
     const speedGate = Math.min(Math.max((8.0 - Math.abs(this.x[I.V])) / 4.0, 0), 1);
-    const zuptWeight = this.motionStillness * speedGate;
+    // GPS-stop confidence: distrust the "stopped" hypothesis proportionally to
+    // the GPS-reported speed. lastGpsSpeed near/above the rest-noise floor
+    // (GPS_REST_NOISE = 1.0) means GPS has NOT confirmed the stop, so ZUPT's
+    // tight bias-learning would misattribute real creep to bias (the corruption
+    // that pinned aBiasX ≈ 1.2 and locked v near 0 in the traffic-jam scenario
+    // right after GPS init during a crawl). At a genuine stop GPS speed ≈ 0 (or
+    // decays to 0 during coasting), so the factor ≈ 1 and bias learning is
+    // unaffected. Continuous (not a hard gate) so ZUPT eases off smoothly as the
+    // receiver reports more speed. This restores the documented "GPS-gated ZUPT"
+    // in soft form.
+    const gpsStopFactor = Math.min(Math.max(1 - this.lastGpsSpeed / GPS_REST_NOISE, 0), 1);
+    const zuptWeight = this.motionStillness * speedGate * (this.gpsConfirmMoving() ? 0 : 1) * gpsStopFactor;
     this._zuptWeight = zuptWeight;
     this._speedGate = speedGate;
     this._accelGate = 0;
@@ -545,7 +565,24 @@ export class SrEkf {
       this.smoothedSpeed = spd;
       if (spd > 0.1) {
         this.x[I.V] = spd;
-        this.x[I.PSI] = wrapAngle(Math.atan2(vy, vx));
+        // Heading init-snap from the GPS velocity direction, gated on direction
+        // reliability AND whether a compass has already learned the heading.
+        // At creep speeds the Doppler direction std ≈ velR/spd can be 30°+ (e.g.
+        // 0.5/0.86 rad at 0.86 m/s), so snapping would override a compass-learned
+        // heading with noise. updateMag's init-snap carries the symmetric "only
+        // while heading is genuinely unlearned" gate; mirror it here so GPS init
+        // cannot undo a compass bootstrap at low speed (the traffic-jam case: the
+        // vehicle enters GPS coverage already creeping, and the mag owns ψ). At
+        // speed (dirStd < 0.2 rad, i.e. spd > 2.5·velR) the Doppler direction IS
+        // reliable and authoritative, so it snaps regardless. Without a compass
+        // the heading is still unlearned at init → the snap fires (pedestrian
+        // bootstrap preserved).
+        const psiCov = this.S[I.PSI][I.PSI] * this.S[I.PSI][I.PSI];
+        const psiUnlearned = psiCov > this.config.initialCovariance.heading! * 0.99;
+        const dirStd = this.config.measurementNoise.velocity! / spd;
+        if (psiUnlearned || dirStd < 0.2) {
+          this.x[I.PSI] = wrapAngle(Math.atan2(vy, vx));
+        }
       }
       this.gpsInitialized = true;
       this.gpsInitTimeMs = timestampMs;
@@ -629,7 +666,16 @@ export class SrEkf {
     // Speed-dependent velR inflation: ramps from 5× at v=0 to 1× at v≥10
     // Prevents velocity jumps at moderate city speeds (5-10 m/s) where
     // GPS multipath noise is high but the old ramp (v/5) was already flat.
-    const speedRamp = Math.max(0, 1 - Math.abs(this.x[I.V]) / 10);
+    // When GPS has CONFIRMED sustained motion above the rest-noise floor
+    // (gpsConfirmMoving — traffic-jam creep) AND the filter is in the creep
+    // band (|v| < 2.5), skip the inflation entirely: the vehicle is genuinely
+    // creeping and the receiver keeps reporting ~1.2 m/s, so a 3× velR
+    // inflation at v≈0.2 would leave the velocity update at ~2% gain and v
+    // stuck near 0. The ramp is fundamentally a MODERATE-speed jump guard
+    // (5-10 m/s city multipath), so it still applies there and at rest /
+    // ambiguity (ss ≤ rest-noise floor) where a GPS speed spike at a red light
+    // must not drag v up.
+    const speedRamp = (this.gpsConfirmMoving() && Math.abs(this.x[I.V]) < 2.5) ? 0 : Math.max(0, 1 - Math.abs(this.x[I.V]) / 10);
     velR *= (1 + 2 * speedRamp);
 
     // Low-speed GPS Doppler distrust: in urban canyons, multipath can flip the
@@ -727,7 +773,15 @@ export class SrEkf {
     // over 0–1 m/s) that could drift out of sync with the ZUPT / coasting-damping
     // view of "stopped" — one metric, one truth.
     this.updateMotionStillness();
-    const stationaryWeight = this.motionStillness;
+    // Stationary weight: normally the fused motionStillness (1 at a full stop →
+    // GPS Doppler z-blended to zero + velR inflated; 0 at cruise → full weight).
+    // BUT during GPS-confirmed sustained creep the metric deliberately stays
+    // ambiguous (0.5-0.9 in the 1-2 m/s band), which would keep the Doppler
+    // z-blended and velR inflated even though the vehicle is genuinely creeping
+    // — the filter then cannot restore v and its position lags until the
+    // outlier-guard reset snaps ψ to the noisy GPS direction. When GPS confirms
+    // motion above the rest-noise floor, trust the GPS velocity at full weight.
+    const stationaryWeight = this.gpsConfirmMoving() ? 0 : this.motionStillness;
     this.tmpZ[2] = vx * (1 - stationaryWeight);
     this.tmpZ[3] = vy * (1 - stationaryWeight);
     // Cap inflation at 5× (was 10×) so the Kalman gains don't drop below ~16 %
@@ -1208,6 +1262,25 @@ export class SrEkf {
     return Math.exp(-(this._accel3DVar / (T_a * T_a) + this._gyro3DEnergy / (T_w * T_w)));
   }
 
+  // ─── GPS-confirmed sustained motion ─────────────────────────────
+  // Whether GPS has CONFIRMED sustained motion above the rest-noise floor.
+  // Keyed on smoothedSpeed (the 3s EMA of the GPS speed hybrid) rather than
+  // the per-fix lastGpsSpeed: a momentary GPS speed spike at a red light
+  // cannot raise the EMA past GPS_REST_NOISE, while a genuine traffic-jam
+  // creep (~1.2 m/s, i.e. 4.3 km/h) drives it there within a few fixes.
+  // motionStillness itself stays SMOOTH in the 1-2 m/s band by design (it is
+  // the ambiguity window where GPS speed noise is indistinguishable from real
+  // creep), so the ZUPT/velocity consumers get this decisive binary signal
+  // while the reported metric keeps its documented ramp (see the 1.5 m/s
+  // "strictly between 0.1 and 0.9" test). Without this gate, ZUPT pins v≈0
+  // during GPS-confirmed creep and the stationary velocity weight inflates
+  // velR / z-blends the Doppler, so the filter cannot track the creep —
+  // position lags past the outlier-guard threshold and resetFromGps snaps ψ
+  // to the noisy Doppler direction (the traffic-jam heading corruption).
+  private gpsConfirmMoving(): boolean {
+    return !this.coasting && this.smoothedSpeed !== undefined && this.smoothedSpeed > GPS_REST_NOISE;
+  }
+
   private updateMotionStillness(): void {
     // Fused motion stillness ∈ [0,1]: 1 = vehicle velocity ≈ 0, 0 = in motion.
     // GPS fresh: driven by smoothedSpeed (the 3s EMA hybrid) minus the GPS
@@ -1291,6 +1364,18 @@ export class SrEkf {
     const rawAccel = Math.max(sqrtAccelVar, Math.abs(a) / 5);
     this.accelEnergy = 0.9 * this.accelEnergy + 0.1 * Math.min(rawAccel, 5);
 
+    // Bias-INVARIANT raw-accel energy for the a_bias_x mean-reversion gate.
+    // The reversion must stay ON whenever the vehicle is NOT genuinely
+    // accelerating, as seen by the RAW forward axis (|ax| + variance), even if
+    // the current bias estimate is badly wrong. The old gate keyed on accelEnergy,
+    // which includes the bias-corrected |a_forward|/5: if aBiasX is wrong (e.g.
+    // ZUPT learned 1.16 m/s² during a brief creep-window stop), a_forward stays
+    // large → accelEnergy ≥ 0.05 → reversion OFF → the wrong bias is locked in
+    // forever (traffic-jam v-pinning). Raw |ax| is ~0 at cruise regardless of
+    // the bias error, so the reversion continues pulling the bias toward 0.
+    const rawAccelInput = Math.max(sqrtAccelVar, this._lastRawAx / 5);
+    this.rawAccelEnergy = 0.9 * this.rawAccelEnergy + 0.1 * Math.min(rawAccelInput, 5);
+
     // variance-only energy (for stillness/ZUPT/ZARU): a constant bias has zero
     // variance and must NOT count as motion
     this.varAccelEnergy = 0.9 * this.varAccelEnergy + 0.1 * Math.min(sqrtAccelVar, 5);
@@ -1321,7 +1406,16 @@ export class SrEkf {
     // GPS-driven correction. Prevents heading from "getting stuck" during transients.
     // Uses smoothAngAccel to sustain the boost for ~0.5s after the rotation stops.
     const angAccelBoost = Math.min(this.smoothAngAccel / 2.0, 1);  // 0→1 for 0→2 rad/s²
-    this.tmpSqrtQ[I.V][I.V] = pn.velocity! * sqrtDt * speedScale * (1 + sc.velocityAccel! * this.accelEnergy + sc.velocityStep! * stepEnergy);
+    // Velocity Q: during GPS-confirmed sustained creep (traffic jam) do NOT let
+    // speedScale starve it. ZUPT has already drained P[V][V] to near-zero at the
+    // stop, and a 0.2× Q leaves the GPS velocity updates with ~2% gain, so v
+    // stays pinned near 0 while the vehicle creeps and position lags. Floor the
+    // velocity scale at the baseline (as if v≈5 m/s) so GPS velocity can rebuild
+    // the state. Only applies once GPS has CONFIRMED motion (smoothedSpeed above
+    // the rest-noise floor) — at rest / ambiguity the low-Q behavior is kept so
+    // ZUPT stays precise.
+    const velScale = this.gpsConfirmMoving() ? Math.max(speedScale, 1) : speedScale;
+    this.tmpSqrtQ[I.V][I.V] = pn.velocity! * sqrtDt * velScale * (1 + sc.velocityAccel! * this.accelEnergy + sc.velocityStep! * stepEnergy);
     this.tmpSqrtQ[I.PSI][I.PSI] = pn.heading! * sqrtDt * (1 + sc.headingGyro! * this.gyroEnergy + sc.headingStep! * stepEnergy + 0.3 * this.accelEnergy + 1.5 * angAccelBoost + 0.3 * absOmega);
     this.tmpSqrtQ[I.BETA][I.BETA] = pn.sideslip! * sqrtDt * (1 + sc.sideslipGyro! * this.gyroEnergy + sc.sideslipStep! * stepEnergy + 2.0 * angAccelBoost + 0.5 * absOmega);
     this.tmpSqrtQ[I.A_BIAS_X][I.A_BIAS_X] = pn.accelBias! * sqrtDt;
@@ -1352,8 +1446,8 @@ export class SrEkf {
     this.tmpH[2][I.V] = cp;   this.tmpH[2][I.PSI] = -v * sp;  this.tmpH[2][I.BETA] = -v * sp;
     this.tmpH[3][I.V] = sp;   this.tmpH[3][I.PSI] = v * cp;   this.tmpH[3][I.BETA] = v * cp;
     // At low speed, GPS velocity direction is unreliable (multipath, buildings,
-    // slow city driving). Ramp starts at v=0.2 m/s (down from 0.5 to catch slow
-    // corner exits) and reaches full at v=3.0 m/s (~11 km/h). A smoothAngAccel boost
+    // slow city driving). Ramp starts at v=0.3 m/s (down from 0.2 to catch slow
+    // corner exits) and reaches full at v=3.9 m/s (~14 km/h). A smoothAngAccel boost
     // temporarily raises effective speed after a turn so heading corrects faster when
     // it matters most (recovering from corner-exit lag).
     // NOTE: the GPS-velocity heading gain MUST remain non-trivial at low speed
@@ -1362,11 +1456,15 @@ export class SrEkf {
     // The ramp keys on the GPS-confirmed speed (max of filter v and lastGpsSpeed),
     // NOT just filter v: after a long standstill ZUPT has dragged v toward 0, so
     // filter v lags the true speed for seconds at start-of-motion — keying the gain
-    // on filter v alone would zero the velocity-direction columns (v<0.2) during
+    // on filter v alone would zero the velocity-direction columns (v<0.3) during
     // exactly the window when a misaligned compass (which owned ψ at rest) needs
     // to be overridden, leaving heading stuck until GPS position re-learns it.
+    // The denominator was raised 2.8 → 3.6 (full authority at 3.9 m/s instead of
+    // 3.0) so Doppler direction — the least reliable heading reference below ~2 m/s —
+    // holds less sway through the traffic-jam band (0–5 km/h): ~31% at 1.4 m/s
+    // (was 43%), ~0.19 at 1 m/s (kept non-trivial for declination calibration).
     const gainSpeed = Math.max(Math.abs(v), this.lastGpsSpeed);
-    let headingGain = gainSpeed < 0.2 ? 0 : Math.min((gainSpeed - 0.2 + this.gyroEnergy * 0.5 + this.stepEnergy * 1.5 + this.smoothAngAccel * 0.5) / 2.8, 1);
+    let headingGain = gainSpeed < 0.3 ? 0 : Math.min((gainSpeed - 0.3 + this.gyroEnergy * 0.5 + this.stepEnergy * 1.5 + this.smoothAngAccel * 0.5) / 3.6, 1);
 
     // Adaptive initialization boost: during first 30s after GPS init, if heading
     // variance is high, temporarily boost GPS correction to accelerate convergence.
@@ -1721,7 +1819,14 @@ export class SrEkf {
         // to let genuine phone rotation pass.  At speed the gyro is reliable
         // and the standard tight margin protects against mag drift.
         const v = Math.abs(this.x[I.V]);
-        const margin = v < 0.1 ? 2.0 : 0.05;
+        // Margin follows the mag authority regime (mirrors the magHeadingTrust
+        // cutoff): through the crawl band (< 2.5 m/s, i.e. city traffic jams) the
+        // compass is again a primary heading reference, so a real 5-20 Hz compass
+        // with reading noise (consecutive-sample angular rate ≈ 0.3-1 rad/s) must
+        // not be rejected as "drifting". The tight 0.05 rad/s margin applies only
+        // where GPS velocity direction owns heading (≥ 2.5 m/s) and a lagging/
+        // drifting compass must not fight it.
+        const margin = v < 2.5 ? 2.0 : 0.05;
         if (magRate > gyroRate + margin) {
           this.prevCallMagBearing = bearing;
           this.prevCallMagTimeMs = this.lastMagTimeMs;
@@ -1776,8 +1881,17 @@ export class SrEkf {
       // GPS confirms real motion the compass cedes ψ to the GPS velocity
       // direction immediately. The mag keeps full authority whenever GPS has not
       // confirmed motion (lastGpsSpeed ≈ 0, e.g. phone on a table, tunnel stop).
+      // The cutoff is 2.5 m/s (9 km/h) so the compass anchors ψ through the
+      // entire traffic-jam band (0–5 km/h: trust ≈ 0.44 at 5 km/h), handing full
+      // authority to GPS velocity direction only where Doppler heading is
+      // reliable (≥ 9 km/h) — still safely below the >10 km/h mag/GPS
+      // β-oscillation regime. The speed key stays on the RAW lastGpsSpeed (not
+      // the smoothed EMA) so the compass cedes IMMEDIATELY when GPS confirms
+      // genuine motion above the crawl band at rest-exit — an EMA lag would let
+      // a misaligned compass (which owned ψ at rest) keep fighting the
+      // GPS-derived heading for the first seconds of motion.
       const magSpeed = Math.max(Math.abs(this.x[I.V]), this.lastGpsSpeed);
-      magHeadingTrust = Math.max(0, 1 - magSpeed / 1.5);
+      magHeadingTrust = Math.max(0, 1 - magSpeed / 2.5);
     }
     this._debugMagTrust = magHeadingTrust;
     // GPS owns heading → skip the mag correction AND the init snap (keeps

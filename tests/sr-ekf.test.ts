@@ -955,6 +955,86 @@ describe('SrEkf', () => {
     expect(maxPsiJump).toBeLessThan(0.15)
   })
 
+  it('should keep the magnetometer active and anchoring heading during a crawl (traffic jam, ~5 km/h)', () => {
+    // Regression for the traffic-jam heading dead zone: at ~5 km/h the compass
+    // used to be skipped (magHeadingTrust = 1 − magSpeed/1.5 < 0.2 above ~4.3
+    // km/h), leaving heading to the noisy GPS Doppler direction. The authority
+    // cutoff is now 2.5 m/s, so at GPS-confirmed 1.4 m/s (trust ≈ 0.44) the
+    // compass must still fuse and pull ψ toward its bearing. magDeclination
+    // covariance is pinned tiny so the whole correction lands on ψ (a clean
+    // convergence signal).
+    const ekf = new SrEkf({
+      measurementNoise: { position: 3.0, velocity: 0.5, heading: 0.1 },
+      initialCovariance: { magDeclination: 1e-6 }
+    })
+    ekf.reset(0, 0, 0, 0)
+    ekf.updateGps(0, 0, 1.4, 0, 0) // GPS init: creeping east at ~5 km/h
+    expect(ekf.getState().psi).toBeCloseTo(0, 5)
+    const bearing = 0.5
+    for (let i = 0; i < 200; i++) ekf.updateMag(bearing, 1 + i)
+    // ψ must have moved most of the way to the compass bearing (old code skipped
+    // the mag → ψ stayed ≈ 0).
+    expect(ekf.getState().psi).toBeGreaterThan(0.4)
+  })
+
+  it('should keep heading stable through sustained gridlock creep with noisy city Doppler', () => {
+    // Traffic-jam scenario: the vehicle creeps at ~1.2 m/s (~4.3 km/h) for a
+    // minute with noisy urban Doppler direction (σ ≈ 0.35 rad) and a stable
+    // compass. The mag must anchor ψ through the crawl band (previously skipped
+    // above ~4.3 km/h), otherwise the noisy GPS velocity direction wanders the
+    // heading step-to-step. Deterministic seeded noise.
+    const seed = 20260809
+    let s = seed >>> 0
+    const rnd = () => {
+      s = (s + 0x6D2B79F5) >>> 0
+      let t = s
+      t = Math.imul(t ^ (t >>> 15), t | 1)
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+    }
+    const gauss = () => {
+      const u = Math.max(rnd(), 1e-9), v = rnd()
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v)
+    }
+    const ekf = new SrEkf({ measurementNoise: { position: 3.0, velocity: 0.5, heading: 0.1 } })
+    ekf.reset(0, 0, 0, 0)
+    const dt = 0.1
+    const abias = 0.03, gbias = 0.005
+    const vCrawl = 1.2
+    let t = 0, trueX = 0, lastGps = -1, lastMag = -1, prevPsi = 0
+    let maxStepJump = 0, maxAbsErr = 0
+    for (; t < 60; t += dt) {
+      const ts = Math.round(t * 1000)
+      const vTrue = t < 2 ? vCrawl * t / 2 : vCrawl // creep straight east
+      const aTrue = t < 2 ? vCrawl / 2 : 0
+      trueX += vTrue * dt
+      ekf.predict(aTrue + abias, gauss() * 0.05, gbias + gauss() * 0.01, dt, ts)
+      if (ts - lastMag >= 200) {
+        lastMag = ts
+        ekf.updateMag(gauss() * 0.05, ts) // stable compass near 0
+      }
+      if (ts - lastGps >= 1000) {
+        lastGps = ts
+        const dirErr = gauss() * 0.35 // noisy urban Doppler direction
+        const spd = vTrue + gauss() * 0.2
+        ekf.updateGps(
+          trueX + gauss() * 2.0, gauss() * 2.0,
+          spd * Math.cos(dirErr), spd * Math.sin(dirErr), ts, 5
+        )
+      }
+      const psi = ekf.getState().psi
+      const jump = Math.abs((psi - prevPsi + Math.PI) % (2 * Math.PI) - Math.PI)
+      maxStepJump = Math.max(maxStepJump, jump)
+      prevPsi = psi
+      const err = Math.abs((psi + Math.PI) % (2 * Math.PI) - Math.PI)
+      maxAbsErr = Math.max(maxAbsErr, err)
+    }
+    // ψ must not wander with the noisy Doppler direction and must not jump
+    // step-to-step (mag anchors through the crawl band).
+    expect(maxAbsErr * 180 / Math.PI).toBeLessThan(15)
+    expect(maxStepJump * 180 / Math.PI).toBeLessThan(8)
+  })
+
   it('should keep velocity non-negative and heading = motion direction after a U-turn', () => {
     // Reproduces the reported "U-turn → velocity negative / heading snaps to
     // nose" bug. After a 180° heading reversal, the GPS velocity direction is
@@ -1574,7 +1654,7 @@ describe('SrEkf', () => {
 
   it('should not let a misaligned compass drag heading during a low-speed corner', () => {
     // Regression: at low speed (v≈1.1 m/s) the mag trust gate is still active
-    // (magHeadingTrust = 1 - v/1.5 ≈ 0.27 > 0.2), so a compass with a constant
+    // (magHeadingTrust = 1 - v/2.5 ≈ 0.56 > 0.2), so a compass with a constant
     // offset used to fight the GPS velocity-direction update and drag ψ toward
     // the wrong bearing — the "heading stuck at corner entry" symptom. During a
     // gyro-confirmed rotation the mag update must be skipped so the gyro (and
