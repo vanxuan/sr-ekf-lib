@@ -2,13 +2,15 @@
 
 Production-grade Square-Root Extended Kalman Filter for real-time IMU + GPS sensor fusion on mobile devices. Fuses accelerometer, gyroscope, GPS, and magnetometer data into a smooth, drift-resistant navigation solution using a 2D CTRA (Constant Turn Rate and Acceleration) motion model.
 
-**Zero runtime dependencies.** Single TypeScript file — Float64Array-backed, zero-allocation hot path, fixed-size matrices.
+**Zero runtime dependencies.** Modular TypeScript source (entry `src/sr-ekf.ts`, with `config.ts`, `math.ts`, `ctra.ts`, `diagnostics.ts`, `ring-buf.ts`) — Float64Array-backed, zero-allocation hot path, fixed-size matrices.
 
 ## Install
 
 ```bash
 npm install sr-ekf
 ```
+
+**Build-tool compatibility:** type re-exports (`EkfConfig`, `NavigationSolution`, `EkfDiagnostics`) use `export type`, so the package is safe under `isolatedModules` builds (esbuild, Vite, Angular).
 
 ## Quick Start
 
@@ -176,9 +178,9 @@ new SrEkf({
 
 1. **IMU predict** (high rate): bias-corrected readings drive CTRA kinematics. Gyro bias is corrected by ZARU when not rotating. Covariance propagated via QR decomposition.
 
-2. **GPS update** (low rate): 4-DOF (x, y, vx, vy) Kalman update with Mahalanobis gating. Position uses anisotropic noise model. Velocity direction corrects heading when speed > 0.5 m/s.
+2. **GPS update** (low rate): 4-DOF (x, y, vx, vy) Kalman update with Mahalanobis gating. Position uses anisotropic noise model. GPS velocity direction corrects heading via a speed ramp (starts ~0.3 m/s, full authority by ~3.9 m/s), and owns ψ outright above 9 km/h.
 
-3. **Magnetometer update** (medium rate): heading observation with auto-calibrating declination state. Only trusted at low speed (skipped when `|v| > 1.5 m/s`) to avoid fighting GPS velocity direction.
+3. **Magnetometer update** (medium rate): heading observation with auto-calibrating declination state. Owns ψ at rest and through the crawl/traffic-jam band (full authority below ~1 m/s, skipped above 2.5 m/s ≈ 9 km/h) so it never fights the GPS velocity direction at speed.
 
 4. **ZUPT** (on IMU): when the device is stationary (variance-based detection), a zero-velocity pseudo-measurement corrects biases through cross-covariance.
 
@@ -194,7 +196,7 @@ new SrEkf({
 ## Validation
 
 ```bash
-npm test                 # 90 tests (9 QR verification + 81 unit)
+npm test                 # 120 tests (9 QR verification + 111 unit)
 npm run build            # TypeScript → dist/
 ```
 
