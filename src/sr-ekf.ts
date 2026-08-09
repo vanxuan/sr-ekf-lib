@@ -1,4 +1,4 @@
-export { EkfConfig, NavigationSolution, EkfDiagnostics } from './config';
+export type { EkfConfig, NavigationSolution, EkfDiagnostics } from './config';
 
 import { N, M, PRE, MAG_PRE, NTRI, I, DEFAULTS, EPS, MOTION_V_CUT, GPS_REST_NOISE, MOTION_V_CUT_STALE, DEVICE_VAR_SCALE, DEVICE_GYRO_SCALE, DEVICE_ACTIVITY_FLOOR, COAST_DAMP_STILL, EkfConfig, NavigationSolution, EkfDiagnostics } from './config';
 
