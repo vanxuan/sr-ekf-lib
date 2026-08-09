@@ -432,16 +432,23 @@ export class SrEkf {
     // hypothesis (3σ).
     const speedGate = Math.min(Math.max((8.0 - Math.abs(this.x[I.V])) / 4.0, 0), 1);
     // GPS-stop confidence: distrust the "stopped" hypothesis proportionally to
-    // the GPS-reported speed. lastGpsSpeed near/above the rest-noise floor
-    // (GPS_REST_NOISE = 1.0) means GPS has NOT confirmed the stop, so ZUPT's
-    // tight bias-learning would misattribute real creep to bias (the corruption
-    // that pinned aBiasX ≈ 1.2 and locked v near 0 in the traffic-jam scenario
-    // right after GPS init during a crawl). At a genuine stop GPS speed ≈ 0 (or
-    // decays to 0 during coasting), so the factor ≈ 1 and bias learning is
-    // unaffected. Continuous (not a hard gate) so ZUPT eases off smoothly as the
-    // receiver reports more speed. This restores the documented "GPS-gated ZUPT"
-    // in soft form.
-    const gpsStopFactor = Math.min(Math.max(1 - this.lastGpsSpeed / GPS_REST_NOISE, 0), 1);
+    // the GPS-reported speed. Key on smoothedSpeed (the 3s EMA of the GPS speed
+    // hybrid) rather than the raw per-fix lastGpsSpeed, consistent with
+    // gpsConfirmMoving()/updateMotionStillness(): a momentary GPS speed spike at
+    // a red light cannot raise the EMA past the rest-noise floor, so ZUPT's
+    // tight bias-learning keeps running through the glitch. smoothedSpeed near/
+    // above GPS_REST_NOISE (1.0) means GPS has NOT confirmed the stop, so bias-
+    // learning would misattribute real creep to bias (the corruption that pinned
+    // aBiasX ≈ 1.2 and locked v near 0 in the traffic-jam scenario right after
+    // GPS init during a crawl). At a genuine stop smoothedSpeed decays to ≈ 0,
+    // so the factor ≈ 1 and bias learning is unaffected. Continuous (not a hard
+    // gate) so ZUPT eases off smoothly as the receiver reports more speed. This
+    // restores the documented "GPS-gated ZUPT" in soft form. Before the first
+    // GPS fix smoothedSpeed is undefined; trust the stop (factor = 1), matching
+    // the pre-GPS behavior of lastGpsSpeed = 0.
+    const gpsStopFactor = this.smoothedSpeed === undefined
+      ? 1
+      : Math.min(Math.max(1 - this.smoothedSpeed / GPS_REST_NOISE, 0), 1);
     const zuptWeight = this.motionStillness * speedGate * (this.gpsConfirmMoving() ? 0 : 1) * gpsStopFactor;
     this._zuptWeight = zuptWeight;
     this._speedGate = speedGate;
@@ -707,8 +714,16 @@ export class SrEkf {
     // (gap < 20 m), and the GPS direction disagrees with the compass heading by
     // >15° (genuine contradiction, not GPS noise), re-derive ψ from the GPS
     // velocity direction and inflate heading covariance so GPS can refine it.
+    // The near-stopped test is `|v| < 0.5 OR motionStillness > 0.5`: the EMA-keyed
+    // gpsStopFactor/gpsConfirmMoving delay ZUPT disengagement by ~1s at rest-exit,
+    // so by the time lastGpsSpeed first exceeds 2.5 the filter v may already have
+    // built past 0.5 while the velocity-domain metric still reads stopped (the
+    // same EMA lag). In that window the velocity innovation is still too weak to
+    // rotate ψ promptly (headingGain partial, velR inflated), so the snap must
+    // still fire. motionStillness is 0 during genuine steady low-speed driving,
+    // so the widened gate never fires in stop-and-go creep.
     if (!this.coasting &&
-        Math.abs(this.x[I.V]) < 0.5 &&
+        (Math.abs(this.x[I.V]) < 0.5 || this.motionStillness > 0.5) &&
         this.lastGpsSpeed > 2.5 &&
         Math.abs(this.lastOmega) < 0.1 &&
         dxGps * dxGps + dyGps * dyGps < 400) {
