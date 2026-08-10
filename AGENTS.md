@@ -183,13 +183,13 @@ motionStillness = clamp(1 − max(speedEvidence, deviceMotion), 0, 1)
 ```
 
 **Fresh branch** (GPS present, `!coasting`):
-- `speedEvidence = max(0, smoothedSpeed − GPS_REST_NOISE)` where `GPS_REST_NOISE = 1.0`
+- `speedEvidence = max(0, smoothedSpeed − GPS_REST_NOISE) / MOTION_V_CUT` where `GPS_REST_NOISE = 1.0` and `MOTION_V_CUT = 1.0`
 - `smoothedSpeed` = 3 s EMA of `hybridSpeed = max(lastGpsSpeed, 0.3⋅|v|)` — the GPS speed is primary; 30 % of EKF v is a fallback against RF dropouts where GPS briefly reads zero while the vehicle moves.
 - At/below 1 m/s: `speedEvidence = 0` → vehicle reads as stopped regardless of GPS velocity noise.
 - At ≥2 m/s: `speedEvidence ≥ 1` → reads as fully moving.
 
 **Stale branch** (coasting, GPS lost):
-- `speedEvidence = max(|v| / MOTION_V_CUT, 1 − fwdStillness)`, where `MOTION_V_CUT = 9.0` and
+- `speedEvidence = max(|v| / MOTION_V_CUT_STALE, 1 − fwdStillness)`, where `MOTION_V_CUT_STALE = 9.0` and
 - `fwdStillness = exp(−(varAx + varAy) / 0.3²)` — a forward-axis proxy that reads a hand-held tunnel stop (mostly vertical tremor) as still, preventing the "car shoots forward" symptom where a 3D proxy would see movement and block ZUPT.
 - A stale `v ≈ 6` still reads as still via the `|v|/9` term, letting ZUPT recover the corrupted velocity.
 
@@ -463,6 +463,6 @@ Designed for 50–400 Hz IMU and 1–10 Hz GPS on resource-constrained devices:
 ## Validation
 
 ```bash
-npm test                 # 90 tests (9 QR verification + 81 unit)
+npm test                 # 120 tests (9 QR verification + 111 unit)
 npm run test:watch       # watch mode
 ```

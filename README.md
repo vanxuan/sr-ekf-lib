@@ -54,7 +54,7 @@ console.log(nav.x, nav.y, nav.v, nav.psi)  // position, speed, heading
 - **Square-Root EKF** — Cholesky-factored covariance for numerical stability
 - **CTRA motion model** — constant turn rate and acceleration kinematics
 - **GPS latency compensation** — rewinds state to GPS timestamp and replays
-- **Zero-Velocity Update (ZUPT)** — variance-based stillness detection, smooth engagement
+- **Zero-Velocity Update (ZUPT)** — vehicle-stopped detection via fused motionStillness (not raw IMU variance), smooth engagement, GPS-gated
 - **Zero Angular Rate Update (ZARU)** — gyro bias calibration when not rotating
 - **Magnetometer fusion** — auto-calibrates magnetic declination as 8th state
 - **Robust M-estimation** — Cauchy/Huber weighting against GPS outliers
@@ -182,7 +182,7 @@ new SrEkf({
 
 3. **Magnetometer update** (medium rate): heading observation with auto-calibrating declination state. Owns ψ at rest and through the crawl/traffic-jam band (full authority below ~1 m/s, skipped above 2.5 m/s ≈ 9 km/h) so it never fights the GPS velocity direction at speed.
 
-4. **ZUPT** (on IMU): when the device is stationary (variance-based detection), a zero-velocity pseudo-measurement corrects biases through cross-covariance.
+4. **ZUPT** (on IMU): when the vehicle is stopped (fused motionStillness, GPS-gated — raw IMU variance is not used), a zero-velocity pseudo-measurement corrects biases through cross-covariance.
 
 5. **GPS re-acquisition** (after loss): when coasting and a GPS fix's innovation is statistically implausible, the filter snaps directly to the fix (`resetFromGps`) — biases learned during coasting are preserved. The outlier guard no longer masks large position jumps: if it inflates measurement noise >3× and the jump is physically plausible, the fix is force-accepted (when moving >0.5 m/s or the jump exceeds 15m) so recovery is immediate instead of minute-long.
 
