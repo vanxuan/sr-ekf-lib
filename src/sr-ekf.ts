@@ -35,6 +35,8 @@ export class SrEkf {
   private _debugInnovDeg = 0;
   private _debugGateThreshDeg = 0;
   private _debugMagAlpha = 0;
+  private lastMovingPsi = NaN;
+  private lastMovingTimeMs = 0;
 
   private readonly tmpF = matCreate(N, N);
   private readonly tmpFS = matCreate(N, N);
@@ -209,6 +211,8 @@ export class SrEkf {
     this.lastBaroTimeMs = 0;
     this.bufTail = 0;
     this.bufLen = 0;
+    this.lastMovingPsi = NaN;
+    this.lastMovingTimeMs = 0;
     this.imuTS.clear();
     this.stepTS.clear();
   }
@@ -697,6 +701,13 @@ export class SrEkf {
     // Direction-aware position step-change outlier guard
     const dtSinceLastGps = Math.max(effectiveGpsTime - this.lastGpsTimeMs, 0) / 1000;
     this.lastGpsSpeed = Math.sqrt(vx * vx + vy * vy);
+    // Capture EKF heading while genuinely moving — used as a soft prior
+    // in magUpdateSingle at rest to prevent compass interference from
+    // pulling ψ off-course at red lights.
+    if (this.lastGpsSpeed > 2 && !this.coasting) {
+      this.lastMovingPsi = this.x[I.PSI];
+      this.lastMovingTimeMs = effectiveGpsTime;
+    }
     const maxPlausibleSpeed = Math.max(Math.abs(this.x[I.V]) * 2, 1.0) + 2;
     const dxGps = x - this.x[I.X], dyGps = y - this.x[I.Y];
 
@@ -2006,7 +2017,32 @@ export class SrEkf {
       // Adaptive blend: small innovations → 50% (smooth), large innovations → 100% (fast catch-up).
       // During rapid rotation at 2Hz compass rate, fixed 50% creates ~45° steady-state lag.
       // At α=1.0 the lag drops to ~0° while convergence after rotation stops is still <1.5s.
-      const alpha = 0.5 + 0.5 * Math.min(Math.abs(innov), 1);
+      let alpha = 0.5 + 0.5 * Math.min(Math.abs(innov), 1);
+
+      // Heading hold at rest: dampen compass pull when it is moving ψ away
+      // from the last known good heading.  Magnetic interference at red lights
+      // (traffic-light poles, power lines, metal structures) corrupts the
+      // compass, pulling ψ off course while the car is stationary.  The prior
+      // decays linearly over 30 s so genuine phone rotations at rest still
+      // take effect.  Gated on gyro rate < 0.1 rad/s to avoid fighting
+      // deliberate rotations.
+      if (Math.abs(this.lastOmega) < 0.1 &&
+          isFinite(this.lastMovingPsi) &&
+          this.lastMovingTimeMs > 0) {
+        const secSinceMoving = (this.lastMagTimeMs - this.lastMovingTimeMs) / 1000;
+        if (secSinceMoving > 0 && secSinceMoving < 30) {
+          const priorWeight = 1 - secSinceMoving / 30;
+          // Direction from current ψ to the last known good heading
+          const priorInnov = wrapAngle(this.lastMovingPsi - this.x[I.PSI]);
+          // Compass agrees (pulls toward prior) → let it through.
+          // Compass disagrees (pulls away from prior) → dampen.
+          if (innov * priorInnov < 0) {
+            const damp = Math.max(0, 1 - priorWeight * Math.min(Math.abs(priorInnov) / 0.3, 1));
+            alpha *= damp;
+          }
+        }
+      }
+
       this._debugMagAlpha = alpha;
       this.x[I.PSI] = wrapAngle(this.x[I.PSI] + innov * alpha);
     } else {
