@@ -1843,4 +1843,30 @@ describe('SrEkf', () => {
     const stateAfter = ekf.getState()
     expect(stateAfter.x - stateBefore.x).toBeGreaterThan(25)
   })
+
+  it('should snap to GPS position on a large jump at a stop with poor GPS accuracy', () => {
+    // Reproduces the "offroad car icon at the beginning of the trip" symptom.
+    // The car is stopped at a red light (ZUPT holds v≈0). GPS then jumps ~42m
+    // as the car pulls away. With POOR accuracy (40m) the direction-aware guard
+    // floor minForward = posR*2 = 80 swallows the jump, so posR is not inflated
+    // and the posR/preGuardPosR>3 reset never fires — the filter would run a
+    // normal update with posR=40 and a ~0.06 Kalman gain, taking ~50s to
+    // converge. The near-stopped large-jump reset must snap to GPS instead.
+    const ekf = new SrEkf({ measurementNoise: { position: 3.0, velocity: 0.5, heading: 0.1 } })
+    ekf.reset(0, 0, 0, 0)
+    let t = 1000
+    for (let i = 0; i < 6; i++) {
+      for (let k = 0; k < 5; k++) { ekf.predict(0, 0, 0, 0.2, t); t += 200 }
+      ekf.updateGps(0, 0, 0, 0, t, 40)
+    }
+    const stopped = ekf.getState()
+    expect(stopped.v).toBeLessThan(0.1) // ZUPT held v≈0 during the stop
+    for (let k = 0; k < 5; k++) { ekf.predict(0.9, 0, 0, 0.2, t); t += 200 }
+    const gpsX = 40.2, gpsY = 14.7
+    const ret = ekf.updateGps(gpsX, gpsY, 1, 0, t, 40)
+    expect(ret).toBe(true)
+    const s = ekf.getState()
+    const dist = Math.sqrt((s.x - gpsX) ** 2 + (s.y - gpsY) ** 2)
+    expect(dist).toBeLessThan(5)
+  })
 })

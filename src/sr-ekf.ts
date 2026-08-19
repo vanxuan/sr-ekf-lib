@@ -767,15 +767,37 @@ export class SrEkf {
     // noise), the chiSq would pass with inflated R but the Kalman gain
     // drops to ~0.04, producing minute-long convergence. Force reset.
     // Allow snap at low speeds (>0.5 m/s) or for very large jumps (>15m).
-    if (posR / preGuardPosR > 3) {
-      const dxNorm = Math.sqrt(dxGps * dxGps + dyGps * dyGps);
-      if (dxNorm < dtSinceLastGps * 50 + 2 && (Math.abs(this.x[I.V]) > 0.5 || dxNorm > 15)) {
-        this.resetFromGps(x, y, vx, vy);
-        this.lastGpsTimeMs = effectiveGpsTime;
-        this.lastGatePassed = true;
-        if (replayCount > 0) this.replayFromScratch(replayCount);
-        return true;
-      }
+    const dxNorm = Math.sqrt(dxGps * dxGps + dyGps * dyGps);
+    const plausibleJump = dxNorm < dtSinceLastGps * 50 + 2;
+    if (posR / preGuardPosR > 3 && plausibleJump && (Math.abs(this.x[I.V]) > 0.5 || dxNorm > 15)) {
+      this.resetFromGps(x, y, vx, vy);
+      this.lastGpsTimeMs = effectiveGpsTime;
+      this.lastGatePassed = true;
+      if (replayCount > 0) this.replayFromScratch(replayCount);
+      return true;
+    }
+
+    // Near-stopped large-jump reset: when the filter believes the vehicle is
+    // essentially stopped (ZUPT holds |v|≈0) but GPS reports a large, physically
+    // plausible position change, the state has clearly diverged — the EKF cannot
+    // have been dragged there by its near-zero velocity. This matters when GPS
+    // accuracy is POOR: the guard floor minForward = posR*2 then grows with posR
+    // (e.g. 80 at 40m accuracy) and swallows the jump, so no R inflation occurs
+    // and the posR/preGuardPosR>3 path above never fires. The filter runs a
+    // normal update with posR=40 and a ~0.06 Kalman gain, converging a 42m gap
+    // at ~2.5m/fix → ~50s offroad (car icon parked beside the road). At good
+    // accuracy the existing guard-inflation reset already snaps on such a jump,
+    // so this simply makes the poor-accuracy case behave the same way. Genuine
+    // steady low-speed driving has |v|>1 and motionStillness≈0, so it never
+    // fires; only a near-stopped EKF seeing a large jump triggers.
+    if (!this.coasting &&
+        (Math.abs(this.x[I.V]) < 1.0 || this.motionStillness > 0.5) &&
+        dxNorm > 15 && plausibleJump) {
+      this.resetFromGps(x, y, vx, vy);
+      this.lastGpsTimeMs = effectiveGpsTime;
+      this.lastGatePassed = true;
+      if (replayCount > 0) this.replayFromScratch(replayCount);
+      return true;
     }
 
     this.tmpZ[0] = x; this.tmpZ[1] = y; this.tmpZ[2] = vx; this.tmpZ[3] = vy;
