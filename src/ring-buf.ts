@@ -5,6 +5,8 @@ export class RingBuf {
   private readonly mask: number;
 
   constructor(capacity: number) {
+    if ((capacity & (capacity - 1)) !== 0 || capacity <= 0)
+      throw new Error(`RingBuf capacity must be a power of 2, got ${capacity}`);
     this.buf = new Float64Array(capacity);
     this.mask = capacity - 1;
   }

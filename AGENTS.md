@@ -1,6 +1,6 @@
 # Production-grade Square-Root Extended Kalman Filter (SR-EKF) v3
 
-Modular TypeScript library (no runtime dependencies, entry `src/sr-ekf.ts`) for fusing IMU + GPS data using a 2D CTRA (Constant Turn Rate and Acceleration) motion model. Optimized for mobile — minimal allocations, fixed-size matrices, Float64Array-backed. Source is split across `src/config.ts` (types/constants/defaults), `src/math.ts`, `src/ctra.ts`, `src/diagnostics.ts`, `src/ring-buf.ts`, and `src/sr-ekf.ts` (the `SrEkf` class).
+Modular TypeScript library (no runtime dependencies, entry `src/sr-ekf.ts`) for fusing IMU + GPS data using a 2D CTRA (Constant Turn Rate and Acceleration) motion model. Optimized for mobile — minimal allocations, fixed-size matrices, Float64Array-backed. Source is split across `src/config.ts` (types/constants/defaults), `src/math.ts`, `src/ctra.ts`, `src/diagnostics.ts`, `src/ring-buf.ts`, `src/heuristics.ts` (named thresholds and pure gate functions), and `src/sr-ekf.ts` (the `SrEkf` class).
 
 ## State Vector (8-state)
 

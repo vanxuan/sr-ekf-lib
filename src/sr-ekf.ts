@@ -1,6 +1,7 @@
 export type { EkfConfig, NavigationSolution, EkfDiagnostics } from './config';
 
 import { N, M, PRE, MAG_PRE, NTRI, I, DEFAULTS, EPS, MOTION_V_CUT, GPS_REST_NOISE, MOTION_V_CUT_STALE, DEVICE_VAR_SCALE, DEVICE_GYRO_SCALE, DEVICE_ACTIVITY_FLOOR, COAST_DAMP_STILL, EkfConfig, NavigationSolution, EkfDiagnostics } from './config';
+import { EPS_CTRA as EPS_CTRA_H, posGateThreshold, magDriftMargin, magHeadingTrust as magTrustFn, shouldSkipMagForTrust, headingGainRaw, betaTau as betaTauFn, coastDampingR, coastPriorR, isCoastDampingActive, isVelocityPriorActive, traceOfP as traceOfPHeur, COAST_Q_FACTOR as COAST_Q_FACTOR_H, MAX_POS_SIGMA as MAX_POS_SIGMA_H, MAX_VEL_SIGMA as MAX_VEL_SIGMA_H, BARO_DT_MIN, BARO_DT_MAX, BARO_SIN_PITCH_THRESH, BARO_R_MIN, BARO_R_VZ_SCALE, BARO_CHI_SQ_GATE, BARO_NON_COAST_R_SCALE } from './heuristics';
 
 import { matCreate, matLowerToFull, matLowerToFullInto, chol4x4, cholSolve4, ensureDiag, qrInPlace, wrapAngle, copySfromQR } from './math';
 
@@ -163,8 +164,7 @@ export class SrEkf {
     this.S[I.G_BIAS_Z][I.G_BIAS_Z] = Math.sqrt(ic.gyroBias!);
     this.S[I.MAG_DECL][I.MAG_DECL] = Math.sqrt(ic.magDeclination ?? 0.25);
 
-    this._traceCache = 0;
-    for (let i = 0; i < N; i++) this._traceCache += this.S[i][i] * this.S[i][i];
+    this._traceCache = traceOfPHeur(this.S);
 
     this.lastGpsTimeMs = 0;
     this.gpsInitTimeMs = 0;
@@ -370,16 +370,9 @@ export class SrEkf {
     const stillness = this.getStillness();
     this.updateMotionStillness();
 
-    // Sideslip time constant: shorter during angular transients (corner entry/exit)
-    // so β tracks the rapidly changing slip angle instead of lagging and corrupting ψ.
-    // At max angAccel (3 rad/s²), τ drops to 40% of its base value.
-    const angAccelNorm = Math.min(this.smoothAngAccel / 3.0, 1);
-    const betaTauBase = absV < 0.3 ? 0.1
-      : absOmega > EPS ? 1.5
-      : Math.max(0.5, 1.5 - (absV - 1.5) * (1.0 / 3.5));
-    const betaTau = betaTauBase * (1 - 0.6 * angAccelNorm) * (1 - 0.5 * this.stepEnergy);
+    const betaTau = betaTauFn(absV, absOmega, this.smoothAngAccel, this.stepEnergy, EPS_CTRA_H);
     const expDt50 = Math.exp(-dt / 50);
-    computeJacobian(this.x[I.PSI] + this.x[I.BETA], this.x[I.V], a, omegaAvg, dt, betaTau, this.rawAccelEnergy < 0.05 ? expDt50 : 1, EPS, this.tmpF);
+    computeJacobian(this.x[I.PSI] + this.x[I.BETA], this.x[I.V], a, omegaAvg, dt, betaTau, this.rawAccelEnergy < 0.05 ? expDt50 : 1, EPS_CTRA_H, this.tmpF);
 
     for (let i = 0; i < N; i++)
       for (let j = 0; j < N; j++) {
@@ -493,8 +486,8 @@ export class SrEkf {
     // 30s) so genuine motion is preserved but stopped cars converge to v = 0.
     if (this.coasting && !this._zuptEngaged) {
       const coastTimeS = Math.max(0, (this.lastImuTimeMs - this.lastGpsTimeMs)) / 1000;
-      if (coastTimeS > 3 && this.motionStillness > COAST_DAMP_STILL && Math.abs(this.x[I.V]) > 0.05) {
-        const rDamp = Math.max(0.05, 10.0 / Math.max(coastTimeS, 1));
+      if (coastTimeS > 3 && isCoastDampingActive(this.motionStillness, COAST_DAMP_STILL) && Math.abs(this.x[I.V]) > 0.05) {
+        const rDamp = coastDampingR(coastTimeS);
         const innov = -this.x[I.V];
         const SV = this.S[I.V];
         let sInnov = rDamp * rDamp;
@@ -528,9 +521,9 @@ export class SrEkf {
     if (this.coasting && this.coastSpeedReady && this.coastSpeed > 0 && !this._zuptEngaged) {
       const coastTimeS = Math.max(0, (this.lastImuTimeMs - this.lastGpsTimeMs)) / 1000;
       // Only fire when car is genuinely moving (not stopped — ZUPT handles that)
-      if (this.motionStillness < COAST_DAMP_STILL) {
+      if (isVelocityPriorActive(this.motionStillness, COAST_DAMP_STILL)) {
         // Prior R grows with coast time: tight at onset (R=2), loose after 30s (R≈20)
-        const rPrior = Math.min(2.0 + coastTimeS * 0.6, 20.0);
+        const rPrior = coastPriorR(coastTimeS);
         // Innovation is z − h = coastSpeed − v (measurement z is the captured
         // speed at GPS loss). Using v − coastSpeed here would push v AWAY from
         // coastSpeed: a bias-driven overspeed is amplified, and an underspeed
@@ -616,11 +609,7 @@ export class SrEkf {
       this.S[I.A_BIAS_X][I.A_BIAS_X] = Math.sqrt(this.config.initialCovariance.accelBias!);
       this.S[I.G_BIAS_Z][I.G_BIAS_Z] = Math.sqrt(this.config.initialCovariance.gyroBias!);
       this.S[I.MAG_DECL][I.MAG_DECL] = Math.sqrt(this.config.initialCovariance.magDeclination ?? 0.25);
-      let tr = 0;
-      for (let i = 0; i < N; i++) {
-        for (let j = 0; j <= i; j++) { const v = this.S[i][j]; tr += v * v; }
-      }
-      this._traceCache = tr;
+      this._traceCache = traceOfPHeur(this.S);
       this.motionStillness = Math.min(Math.max(1 - Math.max(0, spd - GPS_REST_NOISE) / MOTION_V_CUT, 0), 1);
       return true;
     }
@@ -891,19 +880,18 @@ export class SrEkf {
   // altitude change rate provides a strong speed observable.
   updateBaro(altitude: number, timestampMs: number): void {
     if (!this.gpsInitialized || !isFinite(altitude)) return;
-    if (!this.coasting) { this.lastBaroAlt = altitude; this.lastBaroTimeMs = timestampMs; return; }
     if (!isFinite(this.lastBaroAlt) || timestampMs <= this.lastBaroTimeMs) {
       this.lastBaroAlt = altitude;
       this.lastBaroTimeMs = timestampMs;
       return;
     }
     const dtBaro = (timestampMs - this.lastBaroTimeMs) / 1000;
-    if (dtBaro < 0.05 || dtBaro > 5) { this.lastBaroAlt = altitude; this.lastBaroTimeMs = timestampMs; return; }
+    if (dtBaro < BARO_DT_MIN || dtBaro > BARO_DT_MAX) { this.lastBaroAlt = altitude; this.lastBaroTimeMs = timestampMs; return; }
     // Need pitch estimate — only available when device orientation is set
     const pitch = this.curPitch;
     if (!isFinite(pitch)) { this.lastBaroAlt = altitude; this.lastBaroTimeMs = timestampMs; return; }
     const sinPitch = Math.sin(pitch);
-    if (Math.abs(sinPitch) < 0.03) {
+    if (Math.abs(sinPitch) < BARO_SIN_PITCH_THRESH) {
       // On flat ground — barometer gives no speed information
       this.lastBaroAlt = altitude;
       this.lastBaroTimeMs = timestampMs;
@@ -917,7 +905,10 @@ export class SrEkf {
     // Measurement noise: barometer σ ≈ 0.5m → for 1s windows, vel σ ≈ 0.5 m/s
     // Plus pitch uncertainty: add 10% of the signal
     const hV = sinPitch;
-    const rBaro = Math.max(0.5, Math.abs(vzMeasured) * 0.1);
+    let rBaro = Math.max(BARO_R_MIN, Math.abs(vzMeasured) * BARO_R_VZ_SCALE);
+    // Opportunistic outside coasting: baro still helps on ramps even when GPS
+    // is fresh, but inflate R so GPS remains primary (2× looser).
+    if (!this.coasting) rBaro *= BARO_NON_COAST_R_SCALE;
     const SV = this.S[I.V];
     // hs = H × S = sinPitch × S[V][:]  (scalar QR, same pattern as ZUPT/ZARU)
     const hs = this.tmpLatHS;
@@ -926,7 +917,7 @@ export class SrEkf {
     let sInnov = rBaro * rBaro;
     for (let j = 0; j < N; j++) sInnov += hs[j] * hs[j];
     // Chi-square gate: reject if innovation is statistically implausible (3σ ≈ chi²₁,0.99 = 11.3)
-    if (innov * innov / sInnov > 11.3) return;
+    if (innov * innov / sInnov > BARO_CHI_SQ_GATE) return;
     // State update
     for (let i = 0; i < N; i++) {
       let p = 0;
@@ -1064,19 +1055,10 @@ export class SrEkf {
     // limits — position uncertainty beyond 500m or velocity uncertainty beyond
     // 50 m/s is not useful and risks numerical degradation.
     if (this.coasting) {
-      const MAX_POS_SIGMA = 500;
-      const MAX_VEL_SIGMA = 50;
-      if (this.S[I.X][I.X] > MAX_POS_SIGMA) this.S[I.X][I.X] = MAX_POS_SIGMA;
-      if (this.S[I.Y][I.Y] > MAX_POS_SIGMA) this.S[I.Y][I.Y] = MAX_POS_SIGMA;
-      if (this.S[I.V][I.V] > MAX_VEL_SIGMA) this.S[I.V][I.V] = MAX_VEL_SIGMA;
-      let tr = 0;
-      for (let i = 0; i < N; i++) {
-        for (let j = 0; j <= i; j++) {
-          const v = this.S[i][j];
-          tr += v * v;
-        }
-      }
-      this._traceCache = tr;
+      if (this.S[I.X][I.X] > MAX_POS_SIGMA_H) this.S[I.X][I.X] = MAX_POS_SIGMA_H;
+      if (this.S[I.Y][I.Y] > MAX_POS_SIGMA_H) this.S[I.Y][I.Y] = MAX_POS_SIGMA_H;
+      if (this.S[I.V][I.V] > MAX_VEL_SIGMA_H) this.S[I.V][I.V] = MAX_VEL_SIGMA_H;
+      this._traceCache = traceOfPHeur(this.S);
     }
     if (!isFinite(this.adaNoiseScale) || this.adaNoiseScale < 0) this.adaNoiseScale = 1;
     if (!isFinite(this.robustWeight) || this.robustWeight < 0 || this.robustWeight > 1) this.robustWeight = 1;
@@ -1227,7 +1209,10 @@ export class SrEkf {
   }
 
   private replayFromScratch(count: number): void {
-    const prevRot = this.deviceToEnu;
+    const cloneMat = (m: Float64Array[] | null) =>
+      m ? [new Float64Array(m[0]), new Float64Array(m[1]), new Float64Array(m[2])] : null;
+    const prevRot = cloneMat(this.deviceToEnu);
+    const prevRdv = cloneMat(this.deviceToVehicle);
     const prevAz = this.curAzimuth, prevPi = this.curPitch, prevRo = this.curRoll;
     for (let off = 0; off < count; off++) {
       const srcOff = off * 11;
@@ -1252,6 +1237,7 @@ export class SrEkf {
       );
     }
     this.deviceToEnu = prevRot;
+    this.deviceToVehicle = prevRdv;
     this.curAzimuth = prevAz; this.curPitch = prevPi; this.curRoll = prevRo;
   }
 
@@ -1476,11 +1462,10 @@ export class SrEkf {
     // over-inflates uncertainty.  Heading/bias Q are kept at full strength —
     // ZARU/ZUPT/Mag still provide corrections in these channels.
     if (this.coasting) {
-      const COAST_Q_FACTOR = 0.3;
-      this.tmpSqrtQ[I.X][I.X] *= COAST_Q_FACTOR;
-      this.tmpSqrtQ[I.Y][I.X] *= COAST_Q_FACTOR;
-      this.tmpSqrtQ[I.Y][I.Y] *= COAST_Q_FACTOR;
-      this.tmpSqrtQ[I.V][I.V] *= COAST_Q_FACTOR;
+      this.tmpSqrtQ[I.X][I.X] *= COAST_Q_FACTOR_H;
+      this.tmpSqrtQ[I.Y][I.X] *= COAST_Q_FACTOR_H;
+      this.tmpSqrtQ[I.Y][I.Y] *= COAST_Q_FACTOR_H;
+      this.tmpSqrtQ[I.V][I.V] *= COAST_Q_FACTOR_H;
     }
   }
 
@@ -1512,7 +1497,7 @@ export class SrEkf {
     // holds less sway through the traffic-jam band (0–5 km/h): ~31% at 1.4 m/s
     // (was 43%), ~0.19 at 1 m/s (kept non-trivial for declination calibration).
     const gainSpeed = Math.max(Math.abs(v), this.lastGpsSpeed);
-    let headingGain = gainSpeed < 0.3 ? 0 : Math.min((gainSpeed - 0.3 + this.gyroEnergy * 0.5 + this.stepEnergy * 1.5 + this.smoothAngAccel * 0.5) / 3.6, 1);
+    let headingGain = headingGainRaw(gainSpeed, this.gyroEnergy, this.stepEnergy, this.smoothAngAccel);
 
     // Adaptive initialization boost: during first 30s after GPS init, if heading
     // variance is high, temporarily boost GPS correction to accelerate convergence.
@@ -1728,11 +1713,9 @@ export class SrEkf {
       chiSq = this.computeGpsPostFit(posR, velR, cp0, sp0);
     }
 
-    // Separate position/velocity gating: if joint gate fails, position alone
-    // still deserves a pass (position has higher trust than GPS velocity).
     if (chiSq > this.config.gateThreshold) {
       if (!rw.enabled || totalWeight < 0.1) {
-        if (chiSqPos <= this.config.gateThreshold) {
+        if (chiSqPos <= posGateThreshold(this.config.gateThreshold)) {
           // Position sub-gate passes → accept despite noisy velocity
           // BUT if coasting after GPS loss, force full reset to fix
           // heading/velocity that may be corrupted after extended IMU-only prediction
@@ -1867,14 +1850,7 @@ export class SrEkf {
         // to let genuine phone rotation pass.  At speed the gyro is reliable
         // and the standard tight margin protects against mag drift.
         const v = Math.abs(this.x[I.V]);
-        // Margin follows the mag authority regime (mirrors the magHeadingTrust
-        // cutoff): through the crawl band (< 2.5 m/s, i.e. city traffic jams) the
-        // compass is again a primary heading reference, so a real 5-20 Hz compass
-        // with reading noise (consecutive-sample angular rate ≈ 0.3-1 rad/s) must
-        // not be rejected as "drifting". The tight 0.05 rad/s margin applies only
-        // where GPS velocity direction owns heading (≥ 2.5 m/s) and a lagging/
-        // drifting compass must not fight it.
-        const margin = v < 2.5 ? 2.0 : 0.05;
+        const margin = magDriftMargin(v);
         if (magRate > gyroRate + margin) {
           this.prevCallMagBearing = bearing;
           this.prevCallMagTimeMs = this.lastMagTimeMs;
@@ -1939,12 +1915,10 @@ export class SrEkf {
       // a misaligned compass (which owned ψ at rest) keep fighting the
       // GPS-derived heading for the first seconds of motion.
       const magSpeed = Math.max(Math.abs(this.x[I.V]), this.lastGpsSpeed);
-      magHeadingTrust = Math.max(0, 1 - magSpeed / 2.5);
+      magHeadingTrust = magTrustFn(magSpeed);
     }
     this._debugMagTrust = magHeadingTrust;
-    // GPS owns heading → skip the mag correction AND the init snap (keeps
-    // declination at its last calibrated value; it is a slow random walk).
-    if (magHeadingTrust < 0.2) return;
+    if (shouldSkipMagForTrust(magHeadingTrust)) return;
 
     // Init-snap: bootstrap heading from the compass ONLY while heading is still
     // genuinely unlearned (pre-GPS-init, heading covariance at its initial value).
@@ -1960,10 +1934,7 @@ export class SrEkf {
     if (psiCov > initCovHeading * 0.99)
       this.x[I.PSI] = psiMag;
 
-    // GPS owns heading → skip the mag correction (keeps declination at its last
-    // calibrated value; it is a slow random walk). Only re-engage once mag is
-    // meaningfully trusted again.
-    if (magHeadingTrust < 0.2) { this._debugMagTrust = magHeadingTrust; return; }
+    if (shouldSkipMagForTrust(magHeadingTrust)) { this._debugMagTrust = magHeadingTrust; return; }
 
     const innov = wrapAngle(psiMag - this.x[I.PSI]);
     this._debugInnovDeg = Math.abs(innov) * 180 / Math.PI;

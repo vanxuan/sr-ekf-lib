@@ -51,6 +51,10 @@ export const DEFAULTS = {
 };
 
 export const EPS = 1e-4;
+/** Alias: CTRA small-ω singularity — prefer EPS_CTRA from heuristics. */
+export const EPS_CTRA = EPS;
+/** Alias: τ selector threshold — prefer EPS_TAU_YAW from heuristics. */
+export const EPS_TAU_YAW = EPS;
 
 export const MOTION_V_CUT = 1.0;
 export const GPS_REST_NOISE = 1.0;

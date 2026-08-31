@@ -50,11 +50,17 @@ describe('RingBuf', () => {
   })
 
   it('push updates length up to capacity', () => {
-    const buf = new RingBuf(3)
+    const buf = new RingBuf(4)
     expect(buf.length).toBe(0)
     buf.push(1); expect(buf.length).toBe(1)
     buf.push(2); expect(buf.length).toBe(2)
     buf.push(3); expect(buf.length).toBe(3)
-    buf.push(4); expect(buf.length).toBe(3) // stays at capacity
+    buf.push(4); expect(buf.length).toBe(4)
+    buf.push(5); expect(buf.length).toBe(4) // stays at capacity
+  })
+
+  it('throws for non-power-of-2 capacity', () => {
+    expect(() => new RingBuf(3)).toThrow(/power of 2/)
+    expect(() => new RingBuf(6)).toThrow(/power of 2/)
   })
 })
