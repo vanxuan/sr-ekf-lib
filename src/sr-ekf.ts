@@ -115,10 +115,11 @@ export class SrEkf {
   private adaNoiseScale = 1;
   private adaConvergeCount = 0;
   private _traceCache = 0;
-  private _zuptWeight = 0;
+private _zuptWeight = 0;
   private _speedGate = 0;
   private _accelGate = 0;
   private robustWeight = 1;
+  private consecutiveGuardInflations = 0;
   private _varAx = 0;
   private _varAy = 0;
   private _varGz = 0;
@@ -746,10 +747,14 @@ export class SrEkf {
     const minForward = Math.max(posR * 2, 1.0);
     const minCross   = Math.max(posR * 0.5, 0.5);
     const maxForward = Math.max(maxPlausibleSpeed * dtBase * 2, minForward);
-    const maxCross   = Math.max(maxPlausibleSpeed * dtBase * 0.5, minCross);
+const maxCross   = Math.max(maxPlausibleSpeed * dtBase * 0.5, minCross);
     const preGuardPosR = posR;
+    const guardInflated = Math.abs(forward) > maxForward || Math.abs(cross) > maxCross;
     if (Math.abs(forward) > maxForward) posR *= Math.min(Math.abs(forward) / maxForward, 5);
     if (Math.abs(cross) > maxCross) posR *= Math.min(Math.abs(cross) / maxCross, 10);
+
+    // Track consecutive guard inflations to detect accumulated drift
+    if (guardInflated) this.consecutiveGuardInflations++; else this.consecutiveGuardInflations = 0;
 
     // Guard-inflation-masking: if guard inflates R by >3× and the position
     // jump is physically plausible (at highway speeds ~50 m/s + 2m GPS
@@ -758,10 +763,19 @@ export class SrEkf {
     // Allow snap at low speeds (>0.5 m/s) or for very large jumps (>15m).
     const dxNorm = Math.sqrt(dxGps * dxGps + dyGps * dyGps);
     const plausibleJump = dxNorm < dtSinceLastGps * 50 + 2;
-    if (posR / preGuardPosR > 3 && plausibleJump && (Math.abs(this.x[I.V]) > 0.5 || dxNorm > 15)) {
+    // Also reset on accumulated drift: if guard has inflated for 3+ consecutive
+    // GPS updates AND position error exceeds 5× GPS 1σ accuracy, the filter
+    // has diverged despite GPS updates. This catches the case where drift
+    // accumulates over many GPS cycles (each ignored due to guard inflation) —
+    // plausibleJump fails because the total drift isn't plausible in a single
+    // dt, but the error is huge relative to the original GPS accuracy.
+    const gpsPosSigma = Math.sqrt(preGuardPosR);
+    const hugeDrift = this.consecutiveGuardInflations >= 3 && dxNorm > gpsPosSigma * 5 && posR / preGuardPosR > 3;
+    if ((posR / preGuardPosR > 3 && plausibleJump && (Math.abs(this.x[I.V]) > 0.5 || dxNorm > 15)) || hugeDrift) {
       this.resetFromGps(x, y, vx, vy);
       this.lastGpsTimeMs = effectiveGpsTime;
       this.lastGatePassed = true;
+      this.consecutiveGuardInflations = 0;
       if (replayCount > 0) this.replayFromScratch(replayCount);
       return true;
     }
